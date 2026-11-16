@@ -1,0 +1,432 @@
+name: macOS build and release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: zsh {0}
+
+env:
+  # Pin the exact Xcode/SDK used for local development builds. Standard
+  # AppKit controls (NSToolbar, NSSegmentedControl, window materials) render
+  # differently depending on which macOS SDK the app links against, so an
+  # unpinned CI Xcode version silently produces a visually different app.
+  DEVELOPER_DIR: /Applications/Xcode_26.0.1.app/Contents/Developer
+
+jobs:
+  # Same gate as quality.yml: skip the macOS build for PRs that cannot affect the app.
+  changes:
+    name: Detect Swift-relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      swift: ${{ steps.filter.outputs.swift }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed files
+        id: filter
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: scripts/ci-swift-relevant.sh "$EVENT_NAME" "$BASE_SHA" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build universal DMG
+    needs: changes
+    if: needs.changes.outputs.swift == 'true'
+    runs-on: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Install DMG tooling
+        run: brew install create-dmg
+
+      # This job used to build an ad-hoc package (FANBAR_SIGN_IDENTITY="-"
+      # with FANBAR_ALLOW_ADHOC=1). Ad-hoc signing is no longer supported: the
+      # privileged helper cannot authenticate without a Team ID or a pinnable
+      # leaf certificate, so package-app.sh now exits instead of producing an
+      # app that installs but can never control fans. The build therefore needs
+      # a real identity, supplied as a repository secret for an unprotected
+      # local certificate such as "Local QA Code Signing".
+      - name: Require a signing identity
+        env:
+          FANBAR_SIGN_IDENTITY: ${{ secrets.FANBAR_SIGN_IDENTITY }}
+        run: |
+          if [[ -z "${FANBAR_SIGN_IDENTITY}" ]]; then
+            print -u2 "This workflow needs a code-signing identity."
+            print -u2 "Set the FANBAR_SIGN_IDENTITY repository secret to a certificate name"
+            print -u2 "(for example \"Local QA Code Signing\") and import that certificate on the runner."
+            print -u2 "Ad-hoc signing (FANBAR_SIGN_IDENTITY=- ) is no longer supported."
+            exit 1
+          fi
+          if [[ "${FANBAR_SIGN_IDENTITY}" == "-" ]]; then
+            print -u2 "FANBAR_SIGN_IDENTITY=- is ad-hoc, which this project no longer supports."
+            exit 1
+          fi
+
+      - name: Build signed universal app
+        env:
+          FANBAR_ARCHS: arm64 x86_64
+          FANBAR_SIGN_IDENTITY: ${{ secrets.FANBAR_SIGN_IDENTITY }}
+        run: zsh scripts/package-app.sh
+
+      - name: Build verification DMG
+        env:
+          FANBAR_SIGN_IDENTITY: ${{ secrets.FANBAR_SIGN_IDENTITY }}
+        run: zsh scripts/build-dmg.sh
+
+      - name: Verify bundle and architectures
+        run: |
+          # The bundle is "FanBar Pro.app" and its executable is "FanBar Pro";
+          # both are asserted here so a rename cannot leave this step vacuous.
+          app_bundle="dist/FanBar Pro.app"
+          codesign --verify --deep --strict --verbose=2 "${app_bundle}"
+          app_archs="$(lipo -archs "${app_bundle}/Contents/MacOS/FanBar Pro")"
+          helper_archs="$(lipo -archs "${app_bundle}/Contents/Library/LaunchServices/local.fanbar.helper")"
+          widget_archs="$(lipo -archs "${app_bundle}/Contents/PlugIns/FanBarWidget.appex/Contents/MacOS/FanBarWidget")"
+          cli_archs="$(lipo -archs "${app_bundle}/Contents/Helpers/fanbar")"
+          [[ "${app_archs}" == "x86_64 arm64" || "${app_archs}" == "arm64 x86_64" ]]
+          [[ "${helper_archs}" == "x86_64 arm64" || "${helper_archs}" == "arm64 x86_64" ]]
+          [[ "${widget_archs}" == "x86_64 arm64" || "${widget_archs}" == "arm64 x86_64" ]]
+          [[ "${cli_archs}" == "x86_64 arm64" || "${cli_archs}" == "arm64 x86_64" ]]
+          hdiutil verify dist/FanBar-*.dmg
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FanBar-unnotarized-${{ github.sha }}
+          path: dist/FanBar-*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Sign, notarize, and publish
+    # Local publishing is the default. Set this repository variable to true
+    # only when GitHub Actions should own publication for tag pushes.
+    if: startsWith(github.ref, 'refs/tags/v') && vars.FANBAR_PUBLISH_FROM_CI == 'true'
+    needs: build
+    runs-on: macos-15
+    permissions:
+      contents: write
+    env:
+      FANBAR_ARCHS: arm64 x86_64
+      FANBAR_SIGN_IDENTITY: "${{ vars.MACOS_SIGN_IDENTITY || 'Developer ID Application: JiangLin He (64S5F787T9)' }}"
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install DMG tooling
+        run: brew install create-dmg
+
+      - name: Validate release secrets
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          for variable_name in \
+            MACOS_CERTIFICATE_P12 MACOS_CERTIFICATE_PASSWORD KEYCHAIN_PASSWORD \
+            APPLE_ID APPLE_APP_PASSWORD APPLE_TEAM_ID SPARKLE_PRIVATE_KEY
+          do
+            test -n "${(P)variable_name}" || {
+              print -u2 "Missing GitHub Actions secret: ${variable_name}"
+              exit 1
+            }
+          done
+
+      - name: Validate tag matches app version
+        run: |
+          version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" App/Info.plist)
+          test "${GITHUB_REF_NAME}" = "v${version}" || {
+            print -u2 "Tag ${GITHUB_REF_NAME} does not match Info.plist version ${version}"
+            exit 1
+          }
+
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          certificate_path="${RUNNER_TEMP}/developer-id.p12"
+          keychain_path="${RUNNER_TEMP}/fanbar-signing.keychain-db"
+          print -n "${MACOS_CERTIFICATE_P12}" | /usr/bin/base64 -D > "${certificate_path}"
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${keychain_path}"
+          security import "${certificate_path}" \
+            -k "${keychain_path}" \
+            -P "${MACOS_CERTIFICATE_PASSWORD}" \
+            -A -t cert -f pkcs12
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s -k "${KEYCHAIN_PASSWORD}" \
+            "${keychain_path}"
+          security list-keychains -d user -s "${keychain_path}"
+          security find-identity -v -p codesigning "${keychain_path}"
+          print "FANBAR_CI_KEYCHAIN=${keychain_path}" >> "${GITHUB_ENV}"
+
+      - name: Build Developer ID app and DMG (universal)
+        run: |
+          zsh scripts/package-app.sh
+          zsh scripts/build-dmg.sh
+
+      - name: Build Developer ID app and DMG (arm64)
+        env:
+          FANBAR_ARCHS: arm64
+          FANBAR_APP_OUTPUT: dist/FanBar-arm64.app
+          FANBAR_DMG_OUTPUT: dist/FanBar-${{ github.ref_name }}-arm64.dmg
+        run: |
+          zsh scripts/package-app.sh
+          zsh scripts/build-dmg.sh dist/FanBar-arm64.app
+
+      - name: Build Developer ID app and DMG (x86_64)
+        env:
+          FANBAR_ARCHS: x86_64
+          FANBAR_APP_OUTPUT: dist/FanBar-x86_64.app
+          FANBAR_DMG_OUTPUT: dist/FanBar-${{ github.ref_name }}-x86_64.dmg
+        run: |
+          zsh scripts/package-app.sh
+          zsh scripts/build-dmg.sh dist/FanBar-x86_64.app
+
+      - name: Verify signed release
+        run: |
+          # The default zsh shell does not stop on errors, so only the last
+          # command would count. Every app must verify and hold its expected slices.
+          for app_path expected_archs in \
+            "dist/FanBar Pro.app" "arm64 x86_64" \
+            dist/FanBar-arm64.app "arm64" \
+            dist/FanBar-x86_64.app "x86_64"; do
+            codesign --verify --deep --strict --verbose=2 "${app_path}" || exit 1
+            for binary_path in \
+              "Contents/MacOS/FanBar Pro" \
+              Contents/Library/LaunchServices/local.fanbar.helper \
+              Contents/PlugIns/FanBarWidget.appex/Contents/MacOS/FanBarWidget; do
+              archs="$(lipo -archs "${app_path}/${binary_path}")" || exit 1
+              # Sort the slices so the order lipo prints them in does not matter.
+              archs="${(j: :)${(@o)${(@z)archs}}}"
+              if [[ "${archs}" != "${expected_archs}" ]]; then
+                print -u2 "${app_path}/${binary_path}: expected ${expected_archs}, got ${archs}"
+                exit 1
+              fi
+            done
+          done
+          codesign --verify --verbose=2 dist/FanBar-*.dmg
+
+      - name: Notarize and staple
+        run: |
+          # The default zsh shell does not stop on errors, so a loop would
+          # report only the last DMG. Every DMG must be stapled before release.
+          for dmg_path in dist/FanBar-*.dmg; do
+            zsh scripts/notarize-dmg.sh "${dmg_path}" || exit 1
+          done
+
+      - name: Create checksums
+        run: |
+          # The default zsh shell does not stop on errors, so a loop would
+          # report only the last DMG. Every DMG must get its checksum.
+          for dmg_path in dist/FanBar-*.dmg; do
+            dmg_name="$(basename "${dmg_path}")"
+            (cd dist && shasum -a 256 "${dmg_name}" > "${dmg_name}.sha256") || exit 1
+          done
+
+      - name: Generate signed Sparkle appcast
+        run: |
+          updates_dir="${RUNNER_TEMP}/fanbar-updates"
+          mkdir -p "${updates_dir}"
+          # Sparkle updates only ship the universal DMG; the arch-specific
+          # DMGs are for manual downloads and are excluded from the appcast.
+          version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" App/Info.plist)
+          universal_dmg="dist/FanBar-${version}.dmg"
+          test -f "${universal_dmg}"
+          cp "${universal_dmg}" "${updates_dir}/"
+          # generate_appcast embeds a same-named .md as the update's release notes.
+          zsh scripts/extract-update-notes.sh \
+            "docs/releases/${GITHUB_REF_NAME}.md" \
+            "${updates_dir}/FanBar-${version}.md"
+          print -n "${SPARKLE_PRIVATE_KEY}" | \
+            .build/artifacts/sparkle/Sparkle/bin/generate_appcast \
+              --ed-key-file - \
+              --download-url-prefix \
+                "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/" \
+              --link "https://github.com/${GITHUB_REPOSITORY}" \
+              --maximum-deltas 0 \
+              --embed-release-notes \
+              "${updates_dir}"
+          cp "${updates_dir}/appcast.xml" dist/appcast.xml
+          grep -q 'sparkle:edSignature=' dist/appcast.xml
+
+      - name: Upload signed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FanBar-${{ github.ref_name }}
+          path: |
+            dist/FanBar-*.dmg
+            dist/FanBar-*.dmg.sha256
+            dist/appcast.xml
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        run: |
+          release_files=(dist/FanBar-*.dmg dist/FanBar-*.dmg.sha256 dist/appcast.xml)
+          notes_file="docs/releases/${GITHUB_REF_NAME}.md"
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${release_files[@]}" --clobber
+            if [[ -f "${notes_file}" ]]; then
+              gh release edit "${GITHUB_REF_NAME}" --notes-file "${notes_file}"
+            fi
+          elif [[ -f "${notes_file}" ]]; then
+            gh release create "${GITHUB_REF_NAME}" "${release_files[@]}" \
+              --title "FanBar ${GITHUB_REF_NAME#v}" \
+              --notes-file "${notes_file}"
+          else
+            gh release create "${GITHUB_REF_NAME}" "${release_files[@]}" \
+              --title "FanBar ${GITHUB_REF_NAME#v}" \
+              --generate-notes
+          fi
+
+      - name: Remove temporary keychain
+        if: always()
+        run: |
+          if [[ -n "${FANBAR_CI_KEYCHAIN:-}" && -f "${FANBAR_CI_KEYCHAIN}" ]]; then
+            security delete-keychain "${FANBAR_CI_KEYCHAIN}"
+          fi
+
+  homebrew:
+    name: Open Homebrew cask pull request
+    # Releases never touch Casks/fanbar.rb, so brew kept installing an old
+    # version until someone remembered to run scripts/update-homebrew-cask.py.
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      # Pushes and pull requests made with GITHUB_TOKEN start no workflows, so
+      # the required checks are dispatched on the branch explicitly.
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Pin the cask to this release
+        id: cask
+        shell: bash
+        run: |
+          python3 scripts/update-homebrew-cask.py "${GITHUB_REF_NAME}"
+          if git diff --quiet -- Casks/fanbar.rb; then
+            echo "Casks/fanbar.rb already points at ${GITHUB_REF_NAME}."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push branch and open pull request
+        if: steps.cask.outputs.changed == 'true'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          branch="chore/homebrew-cask-${version}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "${branch}"
+          git commit -m "Update Homebrew cask to ${version}" -- Casks/fanbar.rb
+          # A rerun replaces the branch from an earlier attempt.
+          git push --force origin "${branch}"
+
+          if [[ -z "$(gh pr list --head "${branch}" --base main --state open --json number --jq '.[].number')" ]]; then
+            gh pr create --base main --head "${branch}" \
+              --title "Update Homebrew cask to ${version}" \
+              --body "Pins \`Casks/fanbar.rb\` to the ${GITHUB_REF_NAME} universal DMG. Opened by the release workflow; merge once the checks pass."
+          fi
+
+          # Required checks and the cask install test, run on the pushed commit.
+          gh workflow run quality.yml --ref "${branch}"
+          gh workflow run homebrew.yml --ref "${branch}"
+
+  geo:
+    name: Publish GEO release pages (dev)
+    needs: [release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: fanbar-geo-dev
+      cancel-in-progress: false
+    steps:
+      - name: Check out the release notes
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check out the GEO automation
+        run: git clone --depth 1 https://github.com/helson-lin/fanbar-site.git .geo
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build release pages and GEO files
+        working-directory: .geo
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node scripts/build-release.mjs --src "$GITHUB_WORKSPACE/docs/releases" --tag "$RELEASE_TAG"
+
+      - name: Validate generated output
+        working-directory: .geo
+        run: node scripts/validate-build.mjs --version "${GITHUB_REF_NAME#v}"
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: .geo
+          wranglerVersion: "4.113.0"
+          command: deploy --config wrangler.dev.jsonc
+
+      - name: Verify the dev deployment
+        working-directory: .geo
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            if node scripts/verify-deployment.mjs https://fanbar-site-dev.helson.workers.dev; then
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1

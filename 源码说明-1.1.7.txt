@@ -1,0 +1,114 @@
+FanBar Pro 1.1.7 源码说明
+=========================
+
+版本：FanBar Pro 1.1.7（CFBundleVersion = 117）
+Bundle ID：local.fanbar.app（未变，特权 Helper 的客户端鉴权依赖它）
+可执行文件名：FanBar Pro（.app 与 Contents/MacOS/ 均为该名）
+架构：arm64　最低系统：macOS 15.8（见 App/Info.plist 与 Package.swift）
+签名：Local QA Code Signing（本地证书，无 Team ID；全包统一，无 ad-hoc）
+
+一、本包内容
+------------
+- Sources/FanBar/            主程序（AppKit / SwiftUI）
+- Sources/FanBarShared/      共享层（本地化、诊断、协议、自身签名读取）
+     11 个语言 catalog：Finnish / French / Japanese / Korean / Portuguese /
+     Russian / Spanish / Ukrainian / Vietnamese / **Tibetan（新增）** /
+     **Mongolian（新增）**
+- Sources/FanBarHelper/      特权 Helper
+- Sources/FanBarCLI/         命令行工具 fanbar
+- Sources/FanBarWidget/      Widget 数据层
+- Tip/                       打赏窗口的原始 TipDemo 源码（main.swift / Info.plist /
+                             build.sh / Resources 下的微信与支付宝收款码）
+- WidgetExtension/FanBarWidgetExtension.xcodeproj   Widget 的 Xcode 工程
+- FanBarPro.xcodeproj        主工程的 Xcode 工程
+- Tests/                     单元测试
+- scripts/package-app.sh     唯一的构建入口：编译 + 组装 + 逐个签名 + 校验
+- scripts/make-source-zip.sh 生成内嵌用的源码 zip（自包含校验）
+- 脚本/构建-FanBar-Pro.command   本地包装（固定签名身份后调用 package-app.sh）
+- App/Info.plist             版本与 bundle 元数据
+- App/local.fanbar.helper.plist  嵌入的 LaunchDaemon plist（SMAppService 路径）
+- docs/helper-lifecycle-1.5.6.md  Helper 生命周期与注册方式取舍（仍然适用）
+- Assets/、Resources/        图标与资源
+
+二、构建方式（本机已验证）
+--------------------------
+    cd <本目录>
+    ./一键编译.command            # 或下面这条等价命令
+
+    export FANBAR_SIGN_IDENTITY="Local QA Code Signing"
+    export FANBAR_ARCHS=arm64
+    export FANBAR_DISABLE_SWIFTPM_SANDBOX=1
+    export FANBAR_APP_OUTPUT="build/FanBar Pro.app"
+    export FANBAR_SOURCE_ZIP="<上一层目录>/FanBar-Pro-1.1.7-源码与Xcode工程.zip"
+    zsh scripts/package-app.sh
+
+    产物：build/FanBar Pro.app（1.1.7 / 117，arm64）
+
+说明：
+- **没有 ad-hoc 兜底。** FANBAR_SIGN_IDENTITY 为空或为 `-` 时脚本直接 exit 2；
+  签名前还会用 `security find-identity -v -p codesigning` 校验身份真实存在。
+  ad-hoc 签名的 app 没有 Team ID，SMAppService 会为 helper 写下一条任何代码都
+  满足不了的启动约束（`launchctl print` 里 `LWCR … cdhash "$in" = [ ]`、
+  `ccat = 0`），于是每次开机约 35 秒后 helper 被 SIGKILL —— 这就是 1.1.5
+  「开机不唤起」的根因。
+- 内嵌源码 zip 在 codesign **之前**放进 Contents/Resources/Source/，
+  因此被 `_CodeSignature/CodeResources` 密封。
+- Hardened Runtime 只在 Developer ID 构建启用（本地证书没有 team，
+  hardened runtime 的 library validation 会拒绝加载 Sparkle）。
+
+三、校验（本机已跑通）
+----------------------
+    codesign -dv --verbose=4 "build/FanBar Pro.app"
+    codesign -dv --verbose=4 "build/FanBar Pro.app/Contents/Library/LaunchServices/local.fanbar.helper"
+    codesign -d -r- "build/FanBar Pro.app"                       # 看 designated requirement
+    codesign -d -r- "build/FanBar Pro.app/Contents/Helpers/fanbar"
+
+注意：**不要**用 `codesign --verify --deep --strict` 校验整个 app。
+Sparkle.framework 的 `Versions/B` + `Versions/Current` 软链布局会让 codesign 报
+"bundle format is ambiguous" 并中止深度遍历。package-app.sh 已改为逐个校验嵌套
+组件（每个结果都无歧义），最后再对 app 做一次非 deep 的 `--verify --strict`：
+
+    for p in "Contents/MacOS/FanBar Pro" \
+             "Contents/MacOS/FanBarDiagnostics" \
+             "Contents/Helpers/fanbar" \
+             "Contents/Library/LaunchServices/local.fanbar.helper" \
+             "Contents/Frameworks/libswift_Concurrency.dylib" \
+             "Contents/PlugIns/FanBarWidget.appex"; do
+        codesign --verify --strict --verbose=1 "build/FanBar Pro.app/$p"
+    done
+    codesign --verify --strict --verbose=2 "build/FanBar Pro.app"
+
+`spctl -a` 对本机构建会输出 `rejected / origin=Local QA Code Signing`：
+本地证书未经过 Apple 公证，这是预期结果，不影响本机运行（Gatekeeper 只对带
+com.apple.quarantine 的下载物生效）。
+
+四、测试
+--------
+    swift test --disable-sandbox --arch arm64
+    # 语言 catalog（含新增两种、以及顺带补上的葡萄牙语）：
+    swift test --disable-sandbox --arch arm64 --filter Catalog
+    # 菜单栏温控逻辑：
+    swift test --disable-sandbox --arch arm64 --filter MenuBarTemperatureSource
+    # Helper 掉线通知：
+    swift test --disable-sandbox --arch arm64 --filter HelperDropNotification
+    # 打赏窗口与页脚：
+    swift test --disable-sandbox --arch arm64 --filter SupportFooter
+
+五、1.1.7 关键改动速览（详见 变更说明-1.1.7.txt）
+--------------------------------------------------
+1. 新增藏语（bo）、蒙古语（mn）。顺带发现并修掉葡萄牙语/乌克兰语/越南语
+   catalog 里 11 条错误格式符（`%,0f`、`.0f%%`），并给它们补上测试。
+2. 菜单栏新增「温控逻辑」：CPU 最热核 / SoC 平均。只影响显示，
+   风扇控制输入始终是 SoC 平均。
+3. 「支持开发」改为打开 app 内独立打赏窗口（离线可用，收款码随包）；
+   浏览器打赏作为窗口内的次要入口。
+4. 放弃 ad-hoc：签名身份必须真实存在，否则构建失败。
+5. Helper 掉线弹系统通知（通用 → FanBar Pro，默认开，10 分钟冷却，
+   主动交还不弹）。
+6. 高温提醒的「提醒温度」数值改红色。
+7. 移除「在 GitHub 点 Star」。
+
+六、备注
+--------
+- 未包含 .build/、dist/ 等构建产物。
+- build/ 下是本轮构建的产物，仅用于自测，**未安装到 /Applications**。

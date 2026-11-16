@@ -1,0 +1,142 @@
+import AppKit
+import FanBarShared
+import SwiftUI
+
+/// Shared chrome for the settings window — system-settings style section headers,
+/// inset cards, footers, and row dividers. Keeps Menu Bar / Cooling / General in sync.
+/// View builders must be main-actor isolated: SwiftUI types such as `Spacer`
+/// are `@MainActor` under Swift 6.
+@MainActor
+enum SettingsChrome {
+    static let contentWidth: CGFloat = SettingsWindowSizing.contentWidth
+    static let horizontalPadding: CGFloat = 24
+    static let topPadding: CGFloat = 20
+    static let bottomPadding: CGFloat = 24
+    static let sectionSpacing: CGFloat = 28
+    static let headerToCardSpacing: CGFloat = 8
+    static let cardCornerRadius: CGFloat = 12
+    static let rowHorizontalPadding: CGFloat = 14
+    static let rowVerticalPadding: CGFloat = 10
+    /// Every row reaches at least this height, so one- and two-line rows
+    /// and switch/picker rows share one rhythm.
+    static let rowMinHeight: CGFloat = 44
+    /// Inset of a highlighted choice inside its card; its corners stay
+    /// concentric with the card's.
+    static let choiceInset: CGFloat = 6
+    /// Shared width for trailing pop-up buttons so their leading edges align.
+    static let trailingControlMinWidth: CGFloat = 140
+
+    static func sectionHeader(
+        _ title: String,
+        trailing: String? = nil
+    ) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            // Smaller and secondary so headers label groups rather than
+            // competing with the 13pt primary row titles beneath them.
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.secondary)
+            Spacer(minLength: 8)
+            if let trailing {
+                Text(trailing)
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(.horizontal, 4)
+    }
+
+    static func sectionFooter(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 11))
+            .foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 4)
+            .padding(.top, 4)
+    }
+
+    static func settingsCard<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 0) { content() }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(cardBackground)
+            .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
+                    .stroke(Color.primary.opacity(0.08), lineWidth: 0.5)
+            )
+    }
+
+    @ViewBuilder
+    static var cardBackground: some View {
+        if #available(macOS 12.0, *) {
+            RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        } else {
+            RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
+                .fill(Color.primary.opacity(0.05))
+        }
+    }
+
+    /// Separates independent settings. Inset on both sides to the row text,
+    /// so it divides content without cutting across the card.
+    static var rowDivider: some View {
+        Divider().padding(.horizontal, rowHorizontalPadding)
+    }
+
+    /// Request the settings window to re-fit after disclosure or content height changes.
+    @MainActor
+    static func requestWindowRefit() {
+        SettingsWindowPresenter.shared.resizeToFitContentSoon()
+    }
+}
+
+extension View {
+    /// Standard settings row: shared insets, minimum height, vertically centered.
+    func settingsRow() -> some View {
+        frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, SettingsChrome.rowHorizontalPadding)
+            .padding(.vertical, SettingsChrome.rowVerticalPadding)
+            .frame(minHeight: SettingsChrome.rowMinHeight)
+    }
+}
+
+/// Vertically stacks a section header, card, and optional footer with system spacing.
+struct SettingsSection<Card: View>: View {
+    let title: String
+    var trailing: String?
+    var footer: String?
+    @ViewBuilder var card: () -> Card
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: SettingsChrome.headerToCardSpacing) {
+            SettingsChrome.sectionHeader(title, trailing: trailing)
+            SettingsChrome.settingsCard(content: card)
+            if let footer {
+                SettingsChrome.sectionFooter(footer)
+            }
+        }
+    }
+}
+
+/// Title with an optional secondary line, the standard label of a settings row.
+struct SettingsRowText: View {
+    let title: String
+    var detail: String?
+    var titleWeight: Font.Weight = .regular
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .fontWeight(titleWeight)
+            if let detail {
+                Text(detail)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}

@@ -1,0 +1,60 @@
+name: Update DMG download badge
+
+on:
+  schedule:
+    - cron: "23 2 * * *"
+  release:
+    types: [published]
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/download-badge.yml
+      - scripts/update-download-badge.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dmg-download-badge
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Count DMG downloads across all releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FANBAR_REPOSITORY: ${{ github.repository }}
+        run: python3 scripts/update-download-badge.py --repo "$FANBAR_REPOSITORY" --output "$RUNNER_TEMP/dmg-downloads.json"
+
+      # main is protected, so the badge lives on its own unprotected `badges` branch.
+      - name: Publish badge to the badges branch if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          worktree="$RUNNER_TEMP/badges"
+          if git ls-remote --exit-code --heads origin badges >/dev/null; then
+            git fetch --depth=1 origin badges
+            git worktree add --detach "$worktree" FETCH_HEAD
+          else
+            git worktree add --detach "$worktree"
+            git -C "$worktree" checkout --orphan badges
+            git -C "$worktree" rm -rf --quiet .
+          fi
+          cp "$RUNNER_TEMP/dmg-downloads.json" "$worktree/dmg-downloads.json"
+          cd "$worktree"
+          git add dmg-downloads.json
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "docs: refresh DMG download badge"
+          git push origin HEAD:refs/heads/badges

@@ -1,0 +1,163 @@
+================================================================================
+  FanBar Pro 1.1.4 · 变更说明（相对上游 FanBar main）
+================================================================================
+  上游仓库   https://github.com/helson-lin/FanBar
+  上游提交   c5525a74150f9d7fab0d19608e5b6f93b6a89adc
+  本版版本   1.1.4（build 114）· Bundle ID local.fanbar.app
+  改动规模   40 个文件修改（+778 / −315），9 个文件新增
+  导出时间   2026-11-11
+================================================================================
+
+
+一、六组实质性改动
+--------------------------------------------------------------------------------
+
+1. 场景自适应：拔电 / 全屏游戏自动切换风扇模式（本版最大的功能）
+   新增 Sources/FanBar/AdaptiveModeCoordinator.swift
+   修改 Sources/FanBar/FanBarSettingsView.swift（新增两行设置项 + 说明文字）
+   修改 Sources/FanBar/FanBarApp.swift（启动时挂上观察者）
+
+   · 两个独立触发：MacBook 切到电池（IOKit 电源事件）、前台出现全屏游戏
+     （NSWorkspace 激活通知 + 轮询兜底，因为 ⌘Esc 退出全屏不触发激活事件）。
+   · 每个触发可映射到六种结果：不变化 / macOS 系统 / 静谧 / 均衡 / 性能 / 极速。
+   · 默认值是"不变化"，没配置过就完全不干预。
+   · 游戏优先于电池；条件全部消失时恢复覆盖前记录的模式，而不是粗暴切"自动"。
+   · 配置键：fanbar.batteryDisconnectAction、fanbar.fullscreenGameAction。
+
+2. 界面语言从 6 种扩到 12 种
+   修改 Sources/FanBarShared/FanBarLocalization.swift（枚举、显示名、语言码、匹配）
+   新增 Sources/FanBarShared/{Korean,Spanish,Portuguese,Ukrainian,Finnish,Vietnamese}Catalog.swift
+       每种 645 条键值，与既有目录逐条对齐
+   修改 FrenchCatalog / JapaneseCatalog / RussianCatalog（补齐新增文案，各 70~90 行）
+
+   最终支持：English、简体中文、繁體中文、日本語、Русский、Français、한국어、
+             Español、Português、Українська、Suomi、Tiếng Việt（另可跟随系统）。
+
+3. helper 在无 Team ID（ad-hoc）环境下的安装与鉴权加固
+   修改 Sources/FanBar/FanBarServiceManager.swift（84 行）
+   修改 Sources/FanBar/LegacyHelperDaemon.swift（63 行）
+   修改 Sources/FanBarHelper/FanBarHelperService.swift（24 行）
+   修改 Sources/FanBar/HelperClient.swift（45 行）
+
+   · SMAppService 注册失败时自动回退 legacy launchd（root LaunchDaemon，经
+     osascript 提权安装），状态查询同样回退，不再一律显示"未注册"。
+   · 没装过 helper 时只做一次文件存在判断，不再每次刷新都 spawn launchctl。
+   · 鉴权：有 Team 时仍用 anchor apple generic + 证书 OU；无 Team 时降级为
+     bundle identifier 完全匹配。校验绑定连接的 audit token，不依赖 PID。
+   · 自签构建下跳过 libswift_Concurrency.dylib 的 Team 锚定检查（打包重签后它
+     保留工具链自身的标识），真正以 root 运行的 helper 本体仍逐项校验。
+
+4. 风扇控制与模式语义务实化
+   修改 Sources/FanBar/FanController.swift（250 行，本版改动最大的单文件）
+   修改 Sources/FanBar/FanMenu.swift
+   修改 Sources/FanBar/HelperStateDisplay.swift、MenuBarDisplay.swift 等
+
+   · 模式名"自动"改称"macOS"，状态行同步为"FanBar Pro 控制 / macOS 控制"。
+   · 失败报告、辅助功能标签统一使用 FanBar Pro 品牌名。
+
+5. 交互细节
+   修改 Sources/FanBar/TemperatureChart.swift（新增"2 分"档）
+       温度曲线原为 10 分起，托盘小面板里看不到刚发生的尖峰，本版补 2 分钟窗口。
+   新增 Sources/FanBar/ResumeCurvePreferences.swift
+       重启后自动恢复自定义风扇曲线的偏好存储（1.1.3 起提供，本版随包）
+
+6. 构建基线与更新策略
+   修改 Package.swift（platforms 改为 .macOS("15.8")）
+   修改 App/Info.plist
+   · 版本 1.1.4 / build 114，显示名 FanBar Pro。
+   · LSMinimumSystemVersion 与 SwiftPM 的 minos 统一为 15.8，不再靠打包脚本对齐。
+   · SUEnableAutomaticChecks 关闭：不在后台发起更新检查，更新改为手动安装。
+
+
+二、新增文件（9 个，已完整包含在本包 Sources/ 与 Tests/ 中）
+--------------------------------------------------------------------------------
+  Sources/FanBar/AdaptiveModeCoordinator.swift        场景自适应协调器
+  Sources/FanBar/ResumeCurvePreferences.swift         重启恢复曲线偏好
+  Sources/FanBarShared/KoreanCatalog.swift            韩语（645 条）
+  Sources/FanBarShared/SpanishCatalog.swift           西班牙语（645 条）
+  Sources/FanBarShared/PortugueseCatalog.swift        葡萄牙语（645 条）
+  Sources/FanBarShared/UkrainianCatalog.swift         乌克兰语（645 条）
+  Sources/FanBarShared/FinnishCatalog.swift           芬兰语（645 条）
+  Sources/FanBarShared/VietnameseCatalog.swift        越南语（645 条）
+  Tests/FanBarTests/ResumeCurvePreferencesTests.swift 对应单元测试
+
+
+三、修改文件清单（40 个）
+--------------------------------------------------------------------------------
+  文件                                                    增删
+  ------------------------------------------------------  ---------
+  App/Info.plist                                           +13 −3
+  Package.swift                                            +1 −1
+
+  Sources/FanBar/
+    CommandLineToolInstaller.swift                         +8 −?
+    CommandLineToolRow.swift                               +10
+    CompatibilityDisplay.swift                             +2
+    CompatibilityUploadView.swift                          +4
+    ControlNotices.swift                                   +8
+    CoolingPresetTiles.swift                               +2
+    DeviceCompatibilityView.swift                          +2
+    DiagnosticUploadView.swift                             +6
+    FanBarApp.swift                                        −3
+    FanBarServiceManager.swift                             +84（重写回退逻辑）
+    FanBarSettingsView.swift                               +138（自适应设置区）
+    FanController.swift                                    +250（模式语义与状态机）
+    FanMenu.swift                                          +12（品牌与模式名）
+    HelperClient.swift                                     +45（连接与重连）
+    HelperStateDisplay.swift                               +4
+    LegacyHelperDaemon.swift                               +63（安装与要求）
+    LegacyStatusItemController.swift                       +4
+    MenuBarDisplay.swift                                   +8
+    MenuBarIconStyle.swift                                 +2
+    MenuBarSettingsViews.swift                             +4
+    OnboardingCard.swift                                   +2
+    OnboardingWindowPresenter.swift                        +4
+    PanelMonitorSettingsSection.swift                      +44
+    RaycastRow.swift                                       +8
+    SMCLockoutRecovery.swift                               +2
+    SettingsWindowPresenter.swift                          +2
+    SupportPrompt.swift                                    +4
+    TemperatureChart.swift                                 +2（2 分钟档）
+    TemperatureLogMaintenance.swift                        +2
+
+  Sources/FanBarHelper/
+    FanBarHelperService.swift                              +24（鉴权降级）
+
+  Sources/FanBarShared/
+    FanBarLocalization.swift                               +30（六种新语言）
+    FrenchCatalog.swift                                    +82
+    JapaneseCatalog.swift                                  +86
+    RussianCatalog.swift                                   +73
+
+  Tests/
+    FanBarHelperServiceTests.swift                         +13
+    ControlNoticeTests.swift                               +4
+    LegacyHelperDaemonTests.swift                          +30
+    SoftwareUpdateConfigurationTests.swift                 +4
+
+  完整逐行差异见：变更补丁/相对上游-main-的改动.patch（2604 行）。
+
+
+四、把改动应用回上游（可选）
+--------------------------------------------------------------------------------
+  在一份干净的 FanBar 仓库（checkout 到 c5525a7）里：
+
+      git apply --3way "变更补丁/相对上游-main-的改动.patch"
+
+  再把第二节列出的 9 个新增文件从本包对应路径复制过去即可。
+  注意补丁不含二进制，也不含本包剔除的 docs 资源。
+
+
+五、已知限制
+--------------------------------------------------------------------------------
+  1. 只在 arm64 上编译验证过。脚本按 arm64 出包，Intel 需自行改架构参数。
+  2. ad-hoc 签名下的 helper 鉴权是降级信任模型（只认 bundle identifier）。
+     要恢复强鉴权请用 Developer ID 重签。
+  3. widget（FanBarWidget）在 ad-hoc 构建中不嵌入：它依赖上游 Team ID 的
+     App Group 授权。主程序缺少 widget 时优雅降级。
+  4. 场景自适应尚未在真机上完整走通"拔电 → 全屏游戏 → 插电"三段链路；
+     风扇实际转速写入也未验证（需真实重启与 sudo 环境）。
+  5. 上游 scripts/package-app.sh 强制要求 Developer ID，直接跑会退出 2；
+     请用本包的 脚本/构建-FanBar-Pro.command。
+
+================================================================================

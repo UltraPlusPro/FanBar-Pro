@@ -1,0 +1,286 @@
+FanBar Pro 1.1.7 变更说明
+==========================
+
+版本：1.1.7（CFBundleVersion 117）　基线：1.1.6（上一版，本项目 1.1.x 线）
+架构：arm64　最低系统：macOS 15.8　签名：Local QA Code Signing（全包统一，无 ad-hoc）
+
+================================================================
+一、新增藏语、蒙古语（葡萄牙语已存在）
+================================================================
+
+改动
+----
+· Sources/FanBarShared/TibetanCatalog.swift（新增，673 条）
+· Sources/FanBarShared/MongolianCatalog.swift（新增，673 条）
+· Sources/FanBarShared/FanBarLocalization.swift
+    - FanBarLanguage 增 `case tibetan` / `case mongolian`
+    - title：བོད་སྐད / Монгол
+    - localizationIdentifier：bo / mn
+    - current：语言码 bo / mn 的系统探测
+    - localized(...) 分派到两个新 catalog
+· 其余 9 个 catalog（Finnish/French/Japanese/Korean/Portuguese/Russian/
+  Spanish/Ukrainian/Vietnamese）随本版新增的 28 个文案键同步补齐，
+  并移除随「在 GitHub 点 Star」一起下线的 3 个旧键。
+
+译文说明
+--------
+· 不追求翻译质量：674 个键里 654 个有实译，其余（纯符号、品牌名、
+  代码片段如 `%@ RPM`、`macOS`、`MEM`、`SSD`）刻意保留原文。
+· 关键约束：`fanBarFormat` 模板的格式符必须与英文逐位一致，否则
+  `String(format:)` 会打印乱码甚至崩。生成器 tools/gen_catalogs.py
+  在写出文件前逐条比对格式符，不一致直接失败。
+
+顺带修掉的既有缺陷（真实崩溃级）
+--------------------------------
+`PortugueseCatalog` 里 5 条、`UkrainianCatalog` 3 条、`VietnameseCatalog` 3 条
+文案把格式符写错了：
+
+    "%.0f°C · %.0f%%"  →  "%,0f°C · %,0f%%"    （葡萄牙语、乌克兰语）
+    "%.0f°C · %.0f%%"  →  "%.0f°C · .0f%%"     （越南语）
+
+`%,0f` 不是合法格式符、`.0f%%` 少了一个 `%`，运行时会打印出错误数值或读取
+不存在的参数。这些 catalog 此前**没有测试文件**，所以一直没被发现。本版：
+
+· 修正上述 11 条文案（只修格式符，不改语义）
+· 新增 Tests/FanBarTests/PortugueseCatalogTests.swift
+· 新增 Tests/FanBarTests/CatalogFormatCoverageTests.swift
+  （对全部 11 种语言统一校验覆盖率、无多余键、格式符一致、无残缺格式符）
+· 新增 TibetanCatalogTests / MongolianCatalogTests
+
+================================================================
+二、菜单栏新增「温控逻辑」选择
+================================================================
+
+改动
+----
+· Sources/FanBar/MenuBarDisplay.swift
+    - 新增 enum MenuBarTemperatureSource { socAverage, hottestCore }
+      preferenceKey = "fanbar.menuBarTemperatureSource"，默认 .socAverage
+    - MenuBarStatusLabel 用 @AppStorage 观察该键，托盘即时刷新
+· Sources/FanBar/MenuBarTemperatureLogicPicker.swift（新增）
+    「温控逻辑」设置行：Picker + 说明文案
+· Sources/FanBar/FanBarSettingsView.swift（菜单栏页第 3 块，图标/显示内容之后）
+· Sources/FanBar/FanController.swift
+    - 新增 menuBarTemperatureCelsius(source:) / menuBarTemperatureCaption(source:)
+    - temperatureToolTip 改按口径生成，注明当前显示的是哪个传感器
+· Sources/FanBar/LegacyStatusItemController.swift（macOS 11 的 AppKit 回退路径）
+
+三条边界（都已用单测钉住）
+--------------------------
+0. **tooltip 不再把「显示的数值」标成「控制输入」**（QA 回归 DEF-3）。
+   同一份采样下 显示 78°C / 控制 61°C 时，旧 tooltip 输出
+   「控制输入：CPU 最热核 · CPU 平均 61°C · 最高 78°C」——数值都对，
+   但把最热核说成了控制输入。现按口径分别表述：
+     · 选最热核：「显示：CPU 最热核 78°C · 控制输入：CPU 平均 61°C」
+     · 选平均  ：「显示：CPU 平均 61°C · 风扇控制使用同一数值（最高 78°C）」
+     · 曲线会话：「显示即控制输入：CPU 平均 55°C」（两者本就是同一个数，
+       不再用两个标签重复同一数值）
+   同时 `MenuBarDisplayMode` 的 title/detail 改为按口径动态生成，
+   例如选最热核时「显示内容」不再写「显示温控曲线的输入温度」。
+   单测：testHottestCoreTooltipDistinguishesShownValueFromControlInput、
+   testSoCAverageTooltipSaysShownValueIsTheControlInput、
+   testDisplayContentCopyFollowsTheTemperatureLogic。
+
+1. **只影响菜单栏显示。** 风扇控制输入仍是 SoC 平均：
+   `displayTemperatureCelsius` 与 `temperatureHistory[].cpuCelsius` 未改。
+   MenuBarTemperatureSourceTests 直接断言同一份采样下：
+       menuBar(.socAverage) = 61、menuBar(.hottestCore) = 78、
+       displayTemperatureCelsius = 61（控制输入不动）
+2. **默认值与 1.1.6 一致。** 未设置/未知值时回落到 .socAverage，
+   所以老用户升级后读数完全不变。
+3. **曲线态优先曲线输入。** 曲线会话进行中，两种口径都显示曲线自己的
+   输入温度（就是用户正在据此调节的那个数），不显示最热核。
+
+================================================================
+三、「支持开发」进入独立打赏 GUI
+================================================================
+
+改动
+----
+· Sources/FanBar/SupportTipView.swift（新增，方案 A：app 内独立 NSWindow）
+    - SupportTipAssets：微信/支付宝两个渠道、图片定位、保存/复制
+    - SupportTipView：分段切换 + 收款码 + 说明 + 保存/复制/关闭
+    - SupportTipWindowPresenter：单例窗口，跟随语言切换标题
+· Sources/FanBar/FanBarSettingsView.swift
+    - SettingsSupportFooter 的「支持开发」改为 SettingsFooterButton（新增），
+      点击打开本地窗口，不再 `NSWorkspace.open`
+    - 新增 SettingsFooterButton：外观与 SettingsFooterLink 一致，但执行动作
+· Sources/FanBar/FanMenu.swift（面板里的「支持开发」也走同一个窗口）
+· Sources/FanBar/Resources/TipWechat.png、TipAlipay.png（SwiftPM 资源）
+· Tip/（TipDemo 原始源码：TipDemo-main.swift、Info.plist、build.sh、
+  Resources/wechat.png、Resources/alipay.png）
+· scripts/package-app.sh：把图片与 TipDemo 源码复制到
+  Contents/Resources/Tip/，并在签名**之前**完成（会被 CodeResources 密封）
+· FanBarLinks.donation 常量保留，仅作为**文档化的地址**备查：打赏窗口内的
+  浏览器打赏入口已在同版本后续微调中移除（见第九节），当前 UI 不再链接它
+
+为什么用方案 A（app 内窗口）而不是方案 B（独立可执行）
+----------------------------------------------------
+TipDemo 依赖 SwiftUI + AppKit 与 `Bundle.main` 里的 PNG，做成独立可执行需要
+再写一套签名与路径解析。app 内窗口让界面、图片、源码全部落在同一个
+`codesign` 封条内，`codesign --verify --strict` 天然覆盖，且离线可用
+（不需要网络即可显示界面与二维码）。
+
+页脚为什么不加第三个链接
+------------------------
+试过把「在浏览器中打赏」放进页脚，被既有测试
+`SettingsSupportFooterTests.testFooterFitsOneLineInEveryLanguage` 拦下：
+乌克兰语单行宽度 520pt > 可用 512pt。因此浏览器入口改放打赏窗口内部，
+页脚保持「免费开源 · 支持开发」两项，所有 11 种语言都能单行放下。
+
+================================================================
+四、放弃 ADHoc 签名（全包 Local QA）+ 源码继续内嵌 + 充分冒烟
+================================================================
+
+scripts/package-app.sh
+----------------------
+· **ad-hoc 变成硬失败**：FANBAR_SIGN_IDENTITY 为空或为 `-` 时直接 exit 2，
+  不再有 ad-hoc 兜底分支。
+· 签名前先 `security find-identity -v -p codesigning` 校验该身份真实存在，
+  打错字不会悄悄降级成别的签名者。
+
+调用方同步（QA 回归：只改脚本不调用方，CI 必红）
+------------------------------------------------
+· .github/workflows/macos-release.yml 的 build job 原来用
+  `FANBAR_SIGN_IDENTITY: "-"` + `FANBAR_ALLOW_ADHOC: "1"` 去跑 package-app.sh，
+  在 ad-hoc 变成硬失败后必然 exit 2。现改为从 `secrets.FANBAR_SIGN_IDENTITY`
+  读取真实身份，并新增一步「Require a signing identity」：缺失或为 `-` 时
+  直接失败并打印清晰的配置提示（不再静默 ad-hoc）。
+· 同一 job 的 verify 步骤写死 `dist/FanBar.app` / `Contents/MacOS/FanBar`，
+  与真实产物 `dist/FanBar Pro.app` / `Contents/MacOS/FanBar Pro` 不符，
+  已全部改正（release job 的同类路径一并修正）。
+· scripts/build-dmg.sh 默认输入 `dist/FanBar.app` → `dist/FanBar Pro.app`。
+· scripts/test-dmg.sh、scripts/release-local.sh 的同类路径一并修正。
+· 6 份 README（en / zh-CN / zh-TW / ja / fr / ru）、CONTRIBUTING.md、
+  README-构建说明.txt 里教用户跑
+  `FANBAR_ALLOW_ADHOC=1 FANBAR_SIGN_IDENTITY=-` 的段落，全部改为
+  「必须提供真实签名身份，本地自签用 `Local QA Code Signing` 之类真实身份名」，
+  并明确写出「ad-hoc 已不再支持，会直接失败」。
+· 源码说明-1.1.5.txt 标注为历史文档（其 ad-hoc 做法已过时）。
+· 注意：DMG **内部**仍命名为 `FanBar.app`，这是 Homebrew cask 的安装约定
+  （Casks/fanbar.rb 的 `app "FanBar.app"`），不是构建产物路径，保持不变。
+· 内嵌源码 zip 仍在 codesign **之前**放入 Contents/Resources/Source/，
+  因此被 `_CodeSignature/CodeResources` 密封。
+· 新增打赏资源的存在性断言（TipWechat.png / TipAlipay.png 非空），
+  缺图会让窗口空白，比构建失败更糟。
+
+scripts/make-source-zip.sh（新增）
+----------------------------------
+生成内嵌用的 FanBar-Pro-1.1.7-源码与Xcode工程.zip：排除 .build/build/dist，
+保留 Tip/，并在压缩前断言 Tip 源码、收款码、Package.swift、Info.plist、
+package-app.sh 都在包内（内嵌源码必须自包含）。
+
+签名一致性
+----------
+app / helper / CLI / FanBarDiagnostics / widget appex / Sparkle 嵌套组件全部用
+同一张本地证书，designated requirement 钉到同一叶证书：
+    identifier "local.fanbar.app"    and certificate leaf = H"bb99…c123"
+    identifier "local.fanbar.helper" and certificate leaf = H"bb99…c123"
+
+================================================================
+五、Helper 掉线弹系统通知（设置项：通用 → FanBar Pro）
+================================================================
+
+改动
+----
+· Sources/FanBar/HelperDropNotification.swift（新增）
+    - HelperDropNotificationSettings：开关键 fanbar.notifyOnHelperDrop，
+      **默认开启**；冷却 600s；启动静默期 20s
+    - HelperDropGate：同一次事件只弹一次
+    - HelperDropCause：connectionLost / processGone，两套文案
+· Sources/FanBar/HelperClient.swift
+    - 新增 onUnexpectedDrop 回调（XPC invalidation/interruption，或探测超时拆连接）
+    - suppressDropReporting()/resumeDropReporting()：区分主动断开
+    - clearConnection 只在「当前代际且确有连接」时上报，避免旧连接迟到的
+      回调重复上报
+· Sources/FanBar/FanController.swift
+    - handleUnexpectedDrop → handleUnexpectedHelperDrop()
+    - refreshHelperStatus 检测「原本 enabled、现在 notRegistered/unavailable」
+      → reportHelperProcessGoneIfNeeded
+    - quit() 与 reRegisterHelper() 期间关闭上报（用户主动/App 自己所为）
+    - setNotifyOnHelperDrop 持久化；通知权限沿用已有的授权，不重复弹窗
+· Sources/FanBar/FanBarSettingsView.swift
+    General →「FanBar Pro」区块新增 Toggle「风扇控制服务掉线时通知我」
+
+必须区分的三种情形
+------------------
+· 用户主动交还 macOS / 停用控制服务 → **不弹**（helperState 已不是 .enabled，
+  且 quit 时已关闭上报）
+· 曲线会话进行中掉线 → **弹**
+· 已加载但进程消失 → **弹**（由 launchd 状态变化触发）
+· 同一次掉线 10 分钟内只弹一次；启动后 20 秒内不弹（正常启动会重新注册 helper，
+  那一下不能算故障）
+
+================================================================
+六、高温提醒「提醒温度」右侧数值改红色
+================================================================
+
+· Sources/FanBar/FanBarSettingsView.swift thresholdRow：
+    PanelPalette(colorScheme:).warmInk  →  Color(nsColor: .systemRed)
+  理由：这个数字本身就是告警阈值，红色让它读作「上限」而不是又一个可调数值；
+  同时 `.systemRed` 会跟随「增强对比度」与浅/深色外观。
+· 面板与曲线上的告警线**不改**（仍用 palette 的 warm/hot 分级）：那里是
+  数据可视化，颜色语义是「温度高低」，改成纯红会与 hot 级别撞色，
+  反而削弱分级。设置页里是一行文字，用它承载「这是告警」最有效。
+
+================================================================
+七、移除「在 GitHub 点 Star」
+================================================================
+
+· Sources/FanBar/FanBarSettingsView.swift：删除该 SettingsFooterLink 及其
+  分隔符
+· Sources/FanBar/GitHubMark.swift：**删除**（唯一引用点已消失，留着只会
+  产生 dead-code 告警）
+· 各 catalog 里的 "Star on GitHub" / "Open the FanBar Pro GitHub repository
+  in a browser" 一并清理（catalog 测试要求「无多余键」）
+· 保留「FanBar Pro 免费开源」文案与「支持开发」
+· FanBarLinks.repository 常量保留（更新源与文案仍引用该地址）
+
+================================================================
+八、测试与验证
+================================================================
+
+swift test 全量：见交付回报（用例/失败/跳过）。
+新增测试文件：
+    TibetanCatalogTests / MongolianCatalogTests / PortugueseCatalogTests /
+    CatalogFormatCoverageTests / MenuBarTemperatureSourceTests /
+    HelperDropNotificationTests / SupportFooterLayoutTests
+改动的既有测试：
+    SettingsSupportFooterTests：语言列表扩到全部 11 种（含新增两种）
+    FakeFanReadingSource：增加 cpuHottestCelsius，用于区分两种温度口径
+
+================================================================
+九、同版本界面微调（版本号仍 1.1.7 / 117）
+================================================================
+
+· Sources/FanBar/SupportTipView.swift：打赏页说明改为「由我业余基于官方开源
+  项目主线 0.9 构建」；英文同步为 "built in my spare time on top of the
+  official 0.9 mainline"。五个语义要素保留：免费开源 / 业余 / 基于官方开源
+  项目主线 0.9 / 签名证书自费 / 随意打赏
+· Sources/FanBar/SupportTipView.swift：移除打赏页底部「用浏览器打开网页打赏」
+  整块（含其上注释）。链接移除后 VStack 的 16pt 间距不变，保存/复制/关闭
+  按钮行位置照旧
+· Sources/FanBar/FanBarSettingsView.swift：SettingsFooterLink 随之不再被引用，
+  **删除该类型**（留着只会产生 dead-code 告警）；SettingsFooterButton 保留
+· FanBarLinks.donation 保留定义并补注释说明「当前 UI 无入口、留作备用」；
+  scripts/unused-code-allowlist.txt 登记 FanBarLinks / repository / donation
+· 11 个 catalog：删除失效的两个浏览器打赏键（标题与 help），并把旧打赏说明
+  的翻译替换为新英文键的翻译
+· Tests/FanBarTests/SupportFooterLayoutTests：原 testDonationLinkIsStillThe-
+  HostedCheckout 改名为 testDonationConstantIsStillTheHostedCheckout（链接已
+  不在 UI 中，断言对象改为常量本身）；新增两条用例，分别守住「源码里不再出现
+  浏览器打赏文案」与「移除链接后窗口不塌陷」
+· Sources/FanBar/Resources/TipWechat.png、TipAlipay.png：换用新的收款码截图
+  （微信图移除了卡片内的非必要文字行，支付宝图移除了卡片内的一条支付方式
+  标签），尺寸分别为 1656×2256 与 1440×2240。TipDemo 自带的 Tip/Resources/
+  副本同步更新为同一份字节
+· scripts/package-app.sh：收款码改为以 Sources/FanBar/Resources/ 为唯一真源，
+  并新增漂移守卫——只要 Tip/Resources/ 里的 TipDemo 副本与真源不一致，打包
+  直接失败并打印同步命令，避免旧收款码被打进包
+· Sources/FanBar/SupportPrompt.swift：每两周弹出的支持提示面板同步改为同一
+  口径（「由我业余基于官方开源项目主线 0.9 构建」），避免与打赏页说法不一致。
+  该句结尾仍是「可以随意支持一下」，与打赏页的「可以随意打赏」区分保留
+· 11 个 catalog：SupportPrompt 那句的英文键同样因改文案而重命名，旧键删除、
+  新键补译文。因面板只有 336pt 宽、字号 11pt，芬兰/法国/蒙古/葡萄牙/俄语/
+  乌克兰语六种语言的初版译文会多折一行（120pt，撞上 SupportPromptTests 的
+  行高上限），已逐语言压缩措辞至 104pt，与英文同高，未放宽任何测试阈值

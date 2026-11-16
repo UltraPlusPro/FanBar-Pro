@@ -1,0 +1,112 @@
+FanBar Pro 1.1.9 (build 119) 版本说明
+2026-11-15 七项意见交付（arm64）
+================================================================================
+
+版本：1.1.8 / 118 → 1.1.9 / 119；Bundle ID（local.fanbar.app）、
+最低系统版本（15.8）不变。全包（app + helper + CLI + Diagnostics +
+Widget + Sparkle 等嵌套组件）均由本机自签证书 Local QA Code Signing 签名。
+本版采用完整源码重建（Xcode 27.2 / Swift 6.4.2，scripts/package-app.sh），
+沿用 1.1.8 的构建链；内嵌源码包同步更名为
+FanBar-Pro-1.1.9-源码与Xcode工程.zip。
+
+--------------------------------------------------------------------------------
+一、打赏界面修复
+--------------------------------------------------------------------------------
+· QQ 群分段按钮标题去掉斜杠英文：改为「反馈群 (QQ)」；提示行去掉
+  “/ Scan with QQ to join group 1135898675”。
+· 打赏界面仅支持简体中文 / 繁体中文：不再跟随界面语言显示英/日/俄等译文，
+  也不显示「中文 / English」并排；其它语言环境一律回退简体中文，繁体环境
+  显示繁体中文（经 TraditionalChineseConverter）。三渠道（微信支付 / 支付宝 /
+  反馈群(QQ)）保留，TipQQ.png 两处打包与 cmp 守卫保持。
+  实现：Sources/FanBarShared/FanBarLocalization.swift 新增
+  fanBarTipChinese(_:) 与 fanBarText/fanBarFormat 的 chineseOnly 参数，
+  Sources/FanBar/SupportTipView.swift 全量接入。
+
+--------------------------------------------------------------------------------
+二、菜单栏动画 / 面板动画（两个独立开关 + 低电量模式硬约束）
+--------------------------------------------------------------------------------
+· 设置 → 菜单栏 → 动画：菜单栏状态项图标随风扇转速旋转（复用
+  MenuBarIconAnimator / MenuBarIconRotor / SwitchFeedbackPreferences）。
+· 设置 → 面板 → 动画：面板内风扇转子与过渡（复用 PanelAnimationPreferences，
+  接通 FanMenu / FanMenuSections 三处动画门）。
+· 内置硬约束（不可配置）：系统开启「低电量模式」时两个动画自动暂停，
+  关闭后自动恢复。实现：ProcessInfo.processInfo.isLowPowerModeEnabled +
+  NSNotification.Name.NSProcessInfoPowerStateDidChange（实际 API 已编译验证），
+  Sources/FanBar/LowPowerMode.swift 的 LowPowerMode / LowPowerModeMonitor，
+  启动时读一次、运行中监听变化；无法取得状态按「不暂停」处理（不误伤）。
+  无关闭该约束的开关，也没有把低电量模式做成用户可配置项。
+
+--------------------------------------------------------------------------------
+三、文案「静音」→「静谧」
+--------------------------------------------------------------------------------
+· 全部中文内置文案、曲线档位名、菜单、提示、版本号说明、内嵌源码 zip 中的
+  「静音」统一改为「静谧」（含繁体 靜音→靜謐）。
+· 英文 Silent / Quiet 未改；日语固有词「静音」（Silent 的正确译法）
+  与 README.ja.md 按「不机械全局替换导致翻译损坏」保留。
+· 与意见 4 曲线模式列表第一档「静谧」保持一致。
+
+--------------------------------------------------------------------------------
+四、菜单栏显示内容新增「曲线模式」
+--------------------------------------------------------------------------------
+· MenuBarDisplayMode 新增 .curveMode（中文名「曲线模式」），出现在
+  设置 → 菜单栏 → 显示内容 的选项里。
+· 显示 = 风扇图标 + 当前曲线模式图标（两个独立 NSStatusItem）。
+  模式取值：静谧 / 均衡 / 性能 / 极速 / 固定 / 自定义…，
+  每一档都有独立 SF Symbol 图标，切换档位图标随之变化。
+  真实映射：FanCoolingPreset 只有 4 个 case（silent/balanced/performance/
+  extreme，rawValue 0…3）；「固定」来自 FanController.Mode.fixed(Int)，
+  「自定义…」来自 CoolingPresetID.custom(UUID)，二者并非该枚举的 case。
+· 两个图标是两个独立 NSStatusItem（不是同一 item 里画两个图）：标准
+  NSStatusBarButton、设置 autosaveName、不设 behavior、不设自定义 view，
+  因此 macOS 原生 ⌘ + 拖拽 可分别调整位置/间距。
+  Sources/FanBar/CurveModeStatusItem.swift；LegacyStatusItemController 接线。
+· 曲线状态项菜单的「自定义…」复用既有曲线自定义界面
+  （设置 → 散热 → FanCurveEditorView）。
+
+--------------------------------------------------------------------------------
+五、新增 5 种语言
+--------------------------------------------------------------------------------
+· 乌克兰语（uk）已存在：核实其在语言选择 UI 里可选（FanBarLanguage.allCases）、
+  catalog 覆盖完整（新增 UkrainianCatalogTests 复核），未重复新建。
+· 新增 罗马尼亚语 ro / 德语 de / 印地语 hi / 马来语 ms：各建 catalog、
+  加入 FanBarLanguage 枚举的 case/title/localizationIdentifier、加入
+  FanBarLocalization 分发与系统语言自动识别、语言选择 UI（allCases 自动纳入）。
+· 覆盖率如实说明：4 个新 catalog 各翻译 121 个高频界面串 / 677 个 call site
+  （约 17.9%），未覆盖 key 运行时回退英文；不是「已完整本地化」。
+  新增对应 *CatalogTests.swift（4×4 项）与 UkrainianCatalogTests；
+  CatalogFormatCoverageTests 的重复键门禁已纳入 4 个新 catalog。
+
+--------------------------------------------------------------------------------
+六、卡巴斯基风格安装器 / 卸载器 + 安装期自动注册两个服务
+--------------------------------------------------------------------------------
+· DMG 根目录仅 安装FanBarPro.app + 卸载FanBarPro.app，主程序
+  FanBar Pro.app 内嵌在 安装FanBarPro.app/Contents/Resources/Payload/。
+· 安装器提权一次，装到 /Applications/FanBar Pro.app；安装期间直接以 root
+  注册两项服务（用户无需再到设置里操作）：
+    1) 后台风扇监控 Helper：沿用 LegacyHelperDaemon.installCommand 的
+       LegacyLaunchd 路径（拷 helper 到 /Library/PrivilegedHelperTools/、
+       写 /Library/LaunchDaemons/local.fanbar.helper.plist、
+       codesign --verify --strict -R 校验、launchctl enable/bootstrap system），
+       本机自签无 Team ID，故不调用 SMAppService。
+    2) 开机 Daemon 冷启动守护：安装
+       /Library/LaunchDaemons/local.fanbar.coldstart.plist 与
+       /Library/Application Support/FanBar/fanbar-coldstart.sh，
+       plutil -lint + bash -n 校验后 launchctl enable/bootout/bootstrap system。
+       行为保持 1.1.8：开机 30/60/90 秒三次 kickstart -k，插电/台式机顺带
+       「均衡」，电池 MacBook 不改曲线，90 秒后本次开机不再拉起。
+· 卸载器反向清理（先 bootout 再删）：helper plist、PrivilegedHelperTools、
+  coldstart plist、fanbar-coldstart.sh、/Library/Logs/FanBar-ColdStart*、
+  /Applications/FanBar Pro.app，以及工程真实使用的偏好/缓存；
+  恒以「✓ 没有残留」+ exit 0 收尾，仅用户取消回欢迎页，永不显示卸载失败。
+· 保留 冷启动加强.command 与设置 → 通用 → 命令行与自动化的加载/卸载开关。
+
+--------------------------------------------------------------------------------
+七、充分 QA（详见交付报告）
+--------------------------------------------------------------------------------
+编译/签名/打包自检 + 行为级验证：打赏三渠道标题与简/繁/其它语言断言、
+动画开关与低电量模式注入、静音 0 命中、曲线六图标与两独立 NSStatusItem、
+5 语言门禁、root 脚本 bash -n / plutil -lint / 离线 dry-run、
+三包 codesign --verify、DMG 根目录与版本、hdiutil verify、unzip -t，
+并主动报告已知问题。
+
+（FanBar Pro 1.1.9 版本说明完）

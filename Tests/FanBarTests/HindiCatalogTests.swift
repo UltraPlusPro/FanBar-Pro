@@ -1,0 +1,65 @@
+import Foundation
+import XCTest
+@testable import FanBarShared
+
+/// Hindi (1.1.9) is a partial catalog: only high-frequency UI strings are
+/// translated and a missing key falls back to English. These tests keep the
+/// preference plumbing, live call sites, format specifiers and duplicate-key
+/// hygiene honest without demanding full coverage.
+final class HindiCatalogTests: XCTestCase {
+    func testHindiPreferenceAndFallback() throws {
+        let saved = UserDefaults.standard.object(forKey: FanBarLanguage.preferenceKey)
+        defer {
+            if let saved {
+                UserDefaults.standard.set(saved, forKey: FanBarLanguage.preferenceKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: FanBarLanguage.preferenceKey)
+            }
+        }
+
+        UserDefaults.standard.set(FanBarLanguage.hindi.rawValue, forKey: FanBarLanguage.preferenceKey)
+        XCTAssertEqual(FanBarLanguage.current, .hindi)
+        XCTAssertEqual(FanBarLanguage.hindi.title, "हिन्दी")
+        XCTAssertEqual(FanBarLanguage.hindi.localizationIdentifier, "hi")
+        // A translated high-frequency key resolves in Hindi.
+        XCTAssertEqual(fanBarText("任意中文", "General"), "सामान्य")
+        // An uncovered format key falls back to English (documented behaviour).
+        XCTAssertEqual(fanBarFormat("风扇 %d", "Fan %d", 2), "Fan 2")
+
+        UserDefaults.standard.set(FanBarLanguage.english.rawValue, forKey: FanBarLanguage.preferenceKey)
+        XCTAssertEqual(fanBarText("任意中文", "General"), "General")
+    }
+
+    func testEveryHindiEntryIsALiveCallSite() throws {
+        let used = Set(try CatalogCallSites.scan().map(\.english))
+        for key in HindiCatalog.strings.keys where !used.contains(key) {
+            XCTFail("Catalog entry no longer used: \"\(key)\"")
+        }
+    }
+
+    func testHindiFormatSpecifiersMatchEnglish() throws {
+        for site in try CatalogCallSites.scan() where site.isFormat {
+            guard let translated = HindiCatalog.text(for: site.english) else { continue }
+            XCTAssertEqual(
+                try CatalogCallSites.specifiers(in: translated),
+                try CatalogCallSites.specifiers(in: site.english),
+                "Hindi specifiers differ for \"\(site.english)\""
+            )
+        }
+    }
+
+    func testHindiHasNoRepeatedKeys() throws {
+        let shared = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/FanBarShared")
+        let text = try String(contentsOf: shared.appendingPathComponent("HindiCatalog.swift"), encoding: .utf8)
+        var seen = Set<String>()
+        for line in text.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("\""), trimmed.hasSuffix(","),
+                  let range = trimmed.range(of: "\": \"") else { continue }
+            let key = String(trimmed[trimmed.index(after: trimmed.startIndex)..<range.lowerBound])
+            XCTAssertTrue(seen.insert(key).inserted, "HindiCatalog.swift repeats key \"\(key)\"")
+        }
+    }
+}

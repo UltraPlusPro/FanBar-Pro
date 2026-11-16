@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  FanBar Pro 1.1.9 · 冷启动加强 Root LaunchDaemon (UID=0)
+  Installed to /Library/LaunchDaemons/local.fanbar.coldstart.plist by
+  Contents/Resources/冷启动加强.command (osascript with administrator privileges).
+
+  Behaviour implemented by the helper script it runs
+  (/Library/Application Support/FanBar/fanbar-coldstart.sh):
+    * RunAtLoad = true: launchd starts it at boot, once.
+    * Boot time from `sysctl -n kern.boottime`; ONLY works in the 30-90 s window.
+    * Three forced cold restarts of the fan-control helper at 30 / 60 / 90 s
+      via `launchctl kickstart -k system/local.fanbar.helper`.
+    * After 90 s (and for the rest of this boot) it never pulls the helper again
+      (a boot-time marker guards against repeated triggers).
+    * `pmset -g batt` + `sysctl -n hw.model`: on AC-powered MacBooks and on
+      desktops it switches the curve to Balanced (`fanbar preset set balanced`);
+      a battery-powered MacBook is deliberately left alone.
+    * Silent, no UI, no Dock icon (ProcessType = Background); log at
+      /Library/Logs/FanBar-ColdStart.log. KeepAlive = false, so the daemon
+      exits for good after the 90 s pass.
+-->
+<dict>
+    <key>Label</key>
+    <string>local.fanbar.coldstart</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Library/Application Support/FanBar/fanbar-coldstart.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/Library/Logs/FanBar-ColdStart.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/FanBar-ColdStart.log</string>
+</dict>
+</plist>

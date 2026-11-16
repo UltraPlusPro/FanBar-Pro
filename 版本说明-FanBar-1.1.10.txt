@@ -1,0 +1,128 @@
+FanBar Pro 1.1.10 (build 120) 版本说明
+2026-11-15 五项意见交付（arm64）
+================================================================================
+
+版本：1.1.9 / 119 → 1.1.10 / 120；Bundle ID（local.fanbar.app）、
+最低系统版本（15.8）不变。全包（app + helper + CLI + Diagnostics +
+Widget + Sparkle 等嵌套组件）均由本机自签证书 Local QA Code Signing 签名。
+本版为完整源码重建（Xcode 27.2 / Swift 6.4.2，scripts/package-app.sh）。
+
+--------------------------------------------------------------------------------
+一、安装器图标：去掉 FanBar Pro 图标外侧那一圈纯白
+--------------------------------------------------------------------------------
+· 1.1.9 的安装器图标把 FanBar 本体缩到白色卡片的 74%，本体外侧留出一圈纯白，
+  看起来像多了一道白边框。
+· 1.1.10 按几何计算把本体放大到盖住整张卡片（含四个圆角）：
+  卡片圆角约 16.6%、macOS 图标圆角约 22.37%，要盖住四角必须让本体超出卡片一圈，
+  解出最小溢出约 9.7px，加 2px 余量后按卡片宽度的 104.7% 绘制。
+  白色卡片只剩自己的投影留在本体外侧，观感更简洁。
+· 卡巴斯基外框（灰底圆角方块 + 向下箭头）保留。
+· 生成工具：/tmp/icons_work/compose2.swift（随安装器源码归档在 图标合成/）。
+
+--------------------------------------------------------------------------------
+二、通用设置默认值
+--------------------------------------------------------------------------------
+· 「手动模式持续」默认 = 不自动恢复（FanController.AutomaticRestoreDuration
+  .defaultDuration = .never）。此前默认 30 分钟，用户选了曲线半小时后风扇
+  会自己交回 macOS。
+· 「重启自动恢复自定义风扇曲线」默认 = 打开。键从未写过时视为开启
+  （ResumeCurvePreferences.isEnabled 用 object(forKey:) as? Bool ?? true）；
+  用户显式关掉会写入 false，仍然生效，不会被新默认值吞掉。
+· 只在"键缺失"时生效，因此升级用户此前明确设过的值（15/30/60 分钟、
+  或已关闭恢复）原样保留。
+
+--------------------------------------------------------------------------------
+三、菜单栏显示内容：「曲线模式」拆成「曲线与温度」「曲线与转速」
+--------------------------------------------------------------------------------
+· MenuBarDisplayMode 新增 curveTemperature / curveRPM 两档，取代 1.1.9 的
+  curveMode；标题分别为「曲线与温度」「曲线与转速」。
+· 第二个独立 NSStatusItem 现在画「当前曲线档位图标 + 紧挨其右侧的读数」：
+  温度档显示温度（100° 量级，随温度口径设置变化），转速档显示平均 RPM
+  （千位分隔，8,888 量级）。宽度按最宽读数固定，数字变化不会让状态项
+  和它锚定的面板跳动。
+· 仍不设置自定义 view、不改 behavior，保留 autosaveName（FanBarCurveMode），
+  原生 ⌘ 拖拽可把这一组整体拖到任意位置；风扇图标仍是主状态项。
+· 旧值兼容：1.1.9 存过 "curveMode" 的安装，启动时会由
+  MenuBarDisplayMode.repairStoredValue() 一次性改写为 curveTemperature，
+  不会掉回"仅图标"。
+
+--------------------------------------------------------------------------------
+四、整体稳定性与 App / Helper 加固
+--------------------------------------------------------------------------------
+参考《按形态跑：macOS 27 时代 Apple 开发者签名、公证与分发新手全攻略》：
+本版把该文第 2 章「签名工艺」与第 12 章自检清单里能在本地落地的条目做成了
+构建期硬门禁，并补齐 helper 的自愈路径。
+
+4.1 Helper 自愈（Sources/FanBarHelper）
+· 唤醒后丢弃缓存的 SMC 会话：SMC 句柄并非每次睡眠都能存活，留着旧句柄时
+  之后的写入会一直失败，直到服务重启。现在 systemDidWake 直接清掉缓存，
+  下一次读重开。
+· 写入失败一次即换新会话重试一次：unavailable / operation / unlockTimeout
+  这三类失败重开会话是已知解法；invalidValue / modeKeyMissing 换会话也一样失败，
+  不做无意义重试。重试结果写入运行时诊断（helper / recovery）。
+· 读失败同样丢弃陈旧会话，避免每 2 秒轮询重复同一个错误。
+
+4.2 Helper 卡死看门狗（Sources/FanBarHelper/HelperWatchdog.swift）
+· 所有硬件调用都跑在一条串行队列上。若某次 SMC 交互永不返回，队列会永久堵死，
+  而 launchd 看到进程还活着，KeepAlive 不会触发，用户只能重启 Mac。
+· 看门狗由队列自己在每次对外操作前后打点，独立队列每 2 秒采样；单次操作超过
+  12 秒即以 EXIT_FAILURE 退出，让 launchd 立刻重启服务（KeepAlive
+  SuccessfulExit=false）。App 侧 ReplyGate 超时后由 onConnectionReset 重新下达
+  用户选择的模式，因此用户看到的是"抖一下自愈"而不是"风扇控制没了"。
+
+4.3 launchd 侧加固
+· Helper plist 增加 ThrottleInterval=10（崩溃重启不会形成风暴）、
+  ExitTimeOut=5（卡死进程给 5 秒退出再升级）。两处模板同步：
+  App/local.fanbar.helper.plist 与安装引擎 install-core.sh 生成的 plist。
+
+4.4 构建期签名审计（scripts/audit-bundle.sh，由 package-app.sh 调用）
+· 所有 Mach-O 不得携带 com.apple.security.get-task-allow。
+· 每个 Mach-O 必须通过 codesign --verify --strict。
+· App 与内嵌 Helper 必须锚定同一签名身份（leaf 证书哈希或 Team）：
+  两者不一致时安装会成功，但 helper 的 XPC 校验会拒绝 App，表现为
+  "装完看起来正常、却完全控制不了风扇"。
+· Helper 的 designated requirement 不得退化成裸 identifier。
+· Developer ID 构建强制检查 Hardened Runtime；自签构建按既有设计不加
+  （无 Team 时 Sparkle 会因库校验被拒加载）。
+· App 与 Widget 版本号必须一致。
+
+--------------------------------------------------------------------------------
+五、设备兼容性页面：新增「版本支持说明」
+--------------------------------------------------------------------------------
+· 入口：设置 →「本机能力与兼容性」→ 设备兼容性页面。在该页内容区最上方
+  （测试提示之前）新增一块信息卡片，与页面既有卡片同一视觉语言（controlBackground
+  底色、10pt 圆角、info.circle 图标），并合并为单个辅助功能元素。
+· 文案（中 / 英双份，随 App 语言切换）：
+  「v1.1.x 版本是最后一个支持 Intel 二进制切片以及 macOS 12.7.0 这一低版本
+   系统的版本。Xcode 28 进入 RC 阶段后，届时将编译 v1.2.0：这会弃用 Intel
+   二进制切片，并提升最低系统要求至 macOS 15.8.0。」
+· 目的：把"何时弃用 Intel 切片、何时抬高系统门槛"提前写在用户能看到的
+  地方，避免 v1.2.0 发布时老机器用户觉得被突然抛弃。
+· 本地化：新增 "Version support" 与整段说明两条 key，已补齐 11 份完整
+  目录（俄/日/法/韩/西/葡/乌/芬/越/藏/蒙），目录门禁测试要求"每个扫描到的
+  英文串都必须存在于全部完整目录"，已通过。德/印地/马来/罗马尼亚四份
+  部分目录同步补了两条标题 key。
+
+--------------------------------------------------------------------------------
+六、兼容性
+--------------------------------------------------------------------------------
+· 偏好键名全部沿用：fanbar.menuBarDisplayMode / fanbar.menuBarTemperatureSource /
+  fanbar.automaticRestoreDuration / fanbar.resumeLastCurveOnLaunch /
+  fanbar.resumeLastCurveMode。仅新增 user-facing 枚举值。
+· 1.1.9 的「曲线模式」显示选择自动迁移为「曲线与温度」。
+· 安装器（安装FanBarPro.app / 卸载FanBarPro.app）沿用卡巴斯基式两段式流程：
+  安装期以 root 直接注册 local.fanbar.helper（LegacyLaunchd）与
+  local.fanbar.coldstart（开机冷启动）两项服务，用户无需进系统设置。
+
+--------------------------------------------------------------------------------
+七、验证
+--------------------------------------------------------------------------------
+· 单元测试：swift test 全量 570 项，0 失败 / 6 跳过（跳过项为需要真实硬件
+  与 GUI 会话的用例），含新增 MenuBarDisplayModeTests 7 项、
+  ResumeCurvePreferencesTests 默认值 3 项、11 份完整目录 + 4 份部分目录的
+  覆盖与死条目门禁。
+· 构建：swift build -c release 通过；scripts/package-app.sh 走完
+  codesign → audit-bundle.sh 六道签名闸门 → 产物签名自检。
+· 安装器：build-installer.sh 生成 Installer 1.1.10 / 120，AppIcon.icns
+  与新合成图标逐字节一致；安装/卸载脚本 bash -n 语法通过。
+

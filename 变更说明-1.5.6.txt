@@ -1,0 +1,188 @@
+FanBar Pro 1.5.6 变更说明
+==========================
+
+版本：1.5.6（CFBundleVersion 156）　基线：1.1.5（115）　对照：官方 0.9.0
+架构：arm64　最低系统：macOS 15.8　签名：Local QA Code Signing
+
+================================================================
+一、【P0】root Helper 开机不唤起
+================================================================
+
+根因（证据链）
+--------------
+崩溃报告 /Library/Logs/DiagnosticReports/local.fanbar.helper-2026-11-12-230400.ips：
+  exception   EXC_CRASH, signal SIGKILL (Code Signature Invalid)
+  termination namespace=CODESIGNING, indicator=Launch Constraint Violation, code=4
+  codeSigningTeamID "", uptime 35（开机约 35 秒）, parentProc launchd
+
+`launchctl print system/local.fanbar.helper` 里的启动约束：
+  LWCR = { reqs = { cdhash = { "$in" = [ ] } }  vers=1 comp=1 ccat=0 }
+`cdhash.$in` 是空集合 ⇒ 任何代码都满足不了。SMAppService 依据父 app 的签名生成这条
+约束；1.1.5 的 app 是 ad-hoc 签名（TeamIdentifier=not set），于是它写出一条永远为假
+的约束。注册当下能起来（IPC 触发），**下一次开机由 launchd 主动拉起时**约束被求值
+→ SIGKILL。这就是「装好能用、重启就掉」。
+
+另有同 label 的双注册：
+  · App 内 Contents/Library/LaunchDaemons/local.fanbar.helper.plist（SMAppService，
+    submitted by smd，parent bundle version 115）
+  · /Library/LaunchDaemons/local.fanbar.helper.plist（旧式遗留，指向
+    /Library/PrivilegedHelperTools/local.fanbar.helper/...，该目录确实存在一份
+    Nov 11 23:19、1,330,096 字节的同版本 helper）
+
+修复
+----
+1. 统一签名（scripts/package-app.sh）
+   · app / helper / CLI / 诊断工具 / widget appex / Sparkle 嵌套组件全部用
+     "Local QA Code Signing" 由内到外签署，不再 ad-hoc。
+   · 结果：两者 Authority 一致，designated requirement 钉到同一张叶证书：
+         identifier "local.fanbar.app"    and certificate leaf = H"bb99…c123"
+         identifier "local.fanbar.helper" and certificate leaf = H"bb99…c123"
+   · Hardened Runtime 改为**仅 Developer ID 构建设置**（本地证书没有 team，
+     hardened runtime 的 library validation 会拒绝加载 Sparkle）。
+
+2. 消除同 label 冲突（Sources/FanBar/LegacyHelperDaemon.swift）
+   installCommand 的第一步现在是幂等清理，且「先删后写」：
+       launchctl bootout system/local.fanbar.helper 2>/dev/null
+       rm -f  /Library/LaunchDaemons/local.fanbar.helper.plist
+       rm -rf /Library/PrivilegedHelperTools/local.fanbar.helper
+   …之后才 ditto → chown root:wheel → codesign --verify --strict -R <钉子要求> →
+   printf plist → launchctl bootstrap。任一步失败即中止且不写 plist（有单测）。
+   可审计：三个节点调用 /usr/bin/logger -t fanbar-helper。
+
+3. 注册自愈
+   · job plist 新增 `Program`（绝对路径）、`RunAtLoad=true`、
+     `KeepAlive={SuccessfulExit:false}`：开机即起、异常退出自动重启。
+   · 新增 Sources/FanBar/HelperJobInspector.swift：解析 `launchctl print`
+     得到 isLoaded / isRunning / pid / state（只看 job，不猜状态）。
+   · 新增 FanBarServiceManager.prepareAtLaunch()：每次启动确认「注册在 → 进程也在」，
+     不在则 kickstart -k；并在 App 启动（applicationDidFinishLaunching）时调用，
+     先于任何温度读数。
+   · 版本漂移检测：比较 /Library/PrivilegedHelperTools/.../Info.plist 的
+     CFBundleVersion 与 app 自身版本，不一致时提示「请重新启用控制服务」。
+
+4. 兜底方案（取舍已写入 docs/helper-lifecycle-1.5.6.md）
+   无 Team ID 的构建**不再尝试 SMAppService**（那条路必然产生不可满足的约束），
+   改为：
+   · FanBarServiceManager.serviceManagementCanAuthenticate =
+     OwnCodeSignature.teamIdentifier() != nil
+   · 为 false 时先 `SMAppService.daemon(...).unregister()`（清掉 1.1.5 留下的
+     坏注册，否则 BTM 下次登录会重新提交），再走 launchd 守护进程路径。
+   · 守护进程签名要求从「只比 identifier」升级为
+     `identifier "local.fanbar.helper" and certificate leaf = H"…"`（叶证书钉死）。
+
+================================================================
+二、【P0】托盘与设置温度不一致
+================================================================
+
+根因（文件:行，1.1.5）
+----------------------
+· SMCClient.swift:81   cpuDisplayCelsius = cpuHottestCelsius ?? cpuCelsius（最热核）
+· MenuBarDisplay.swift:92  托盘用 cpuDisplayCelsius → 截图 63°（最热核）
+· FanController.swift:1774 controlTemperature → FanCurveSensor.maxChip =
+  max(cpuCelsius, gpuCelsius) → 54°（平均值），风扇 1,869 RPM 落在 54° 目标区间
+⇒ 托盘说 63°，设置说 54°，风扇按 54° 转：三个数字两个口径。
+
+决策：以「控制输入温度」为唯一事实来源（而不是把控制回路改成最热核）。
+理由：
+  · 最热核是单点极值，会随采样抖动（同一颗芯片不同核可差 8–12°C），把它作为控制
+    输入需要额外滤波，否则曲线会在拐点附近来回跳，风扇转速可听地喘；
+  · 现有实现已有滞后（hysteresisCelsius）与速率限制（maxFractionStepPerUpdate），
+    是为平均值设计的；换输入口径等于重调整套控制参数，风险远大于收益；
+  · 用户真正想知道的是「风扇为什么是这个转速」——那就是控制输入。
+
+改动
+----
+· SMCClient.swift:80-89   cpuDisplayCelsius 改为 `cpuCelsius ?? cpuHottestCelsius`，
+  注释写明口径与 1.5.6 的变更原因（最热核退化为「历史数据兜底」）。
+· FanController.swift (+246-292) 新增：
+    displayTemperatureCelsius  曲线进行中 = curveTemperatureCelsius（与设置里的
+                               「当前」同一变量）；自动模式 = 最新一次采样的
+                               cpuCelsius（即 CPU-only 曲线会用的同一指标）
+    displayTemperatureCaption  口径名（如「CPU/GPU 较高者」「CPU 平均」）
+    temperatureToolTip         「控制输入：<口径> · CPU 平均 X · 最高 Y」
+· MenuBarDisplay.swift:91-94   托盘改用 controller.displayTemperatureCelsius
+· MenuBarDisplay.swift:74      tooltip 改用 controller.temperatureToolTip
+· MenuBarDisplay.swift:21-40   显示模式标题/说明改为「温度（控制输入）」并说明口径
+· LegacyStatusItemController.swift:235/364  tooltip 与文字同步换源
+· FanCurveEditorView.swift     画布实时标记改为「当前 54°C（CPU/GPU 较高者）→ 目标 …」，
+                               口径直接写在数值旁边，不再只有孤零零的 54°C
+· Tests/FanBarTests/PanelThermalTests.swift 断言改为「显示值 = 平均值 + 最热核单独保留」
+
+验收：同一时刻托盘与设置显示同一个变量（舍入后完全一致，不是 ±1），且 UI 明示口径。
+
+================================================================
+三、【P1】对照官方 0.9.0 的稳固性审查
+================================================================
+
+（1）风险：Helper 客户端鉴权被放宽 —— 已在本版加固
+    0.9.0  FanBarHelperService.clientRequirementText(teamID:)
+           guard let teamID … else { return nil }  → 无 team 的 helper 谁都不信（fail-closed）
+    1.1.5  else { return "identifier \"local.fanbar.app\"" }
+           → 任何本地进程只要 `codesign -s - --identifier local.fanbar.app` 就能驱动 root
+             风扇控制。这是相对 0.9.0 的安全倒退。
+    1.5.6  else { return "identifier \"…\" and certificate leaf = H\"<本 helper 叶证书 SHA-1>\"" }
+           → 回到「只信同一签名身份」，且不需要 Developer ID。
+    影响：中高（本地提权面）。是否已加固：是。后续：Developer ID 构建自动回到
+    anchor apple generic + OU（更严）。
+
+（2）风险：SMAppService 与 legacy launchd 双轨并存 —— 已在本版收敛
+    两套注册用同一个 label，谁被 launchd 选中取决于历史状态（正是本次开机崩溃的
+    直接原因）。1.5.6 显式按「是否有 team」二选一，并在切换时先 unregister/bootout。
+    后续建议：若长期使用 Developer ID，删掉 legacy 兜底分支以缩小攻击面。
+
+（3）风险：root 运行的是 helper 副本，可能与 app 版本漂移 —— 部分缓解
+    副本在 /Library/PrivilegedHelperTools，升级 app 后不会自动更新；1.1.5 仅在
+    `migrateHelperIfNeeded()` 命中时重装。1.5.6 增加版本比对与 UI 提示。
+    彻底解法（未采用，写入文档）：让 plist 的 Program 直接指向 app 包内 helper，
+    代价是 root 执行用户可写路径上的代码，与 0.9.0 起的安全取向相反。
+
+（4）风险：spctl 不认本地证书 —— 已知限制
+    spctl -a -vv → rejected / origin=Local QA Code Signing。本机构建可用（Gatekeeper
+    只对带 quarantine 的下载物生效），但**不能分发**。需 Developer ID + 公证才能分发。
+
+（5）风险：`codesign --verify --deep --strict` 用不了 —— 已改为逐组件校验
+    Sparkle 的 Versions/B + Versions/Current 软链布局会让深度遍历报
+    "bundle format is ambiguous" 并中止。package-app.sh 改为逐个嵌套组件
+    `--verify --strict`（每个都无歧义）+ 对 app 一次非 deep 的 `--verify --strict`。
+
+（6）风险：自适应模式（1.1.x 新增，0.9.0 无）会接管用户的模式 —— 未改动，建议后续
+    AdaptiveModeCoordinator 每 3s 轮询前台 app 与电源状态，命中后直接改模式。
+    风险：与用户的定时恢复（automaticRestoreDuration）叠加时语义不清；
+    全屏游戏判定依赖 frontmost app + 全屏窗口，误判会导致风扇模式被反复切换。
+    建议：加「同一触发器 10s 内不重复应用」的冷却与可见的覆盖提示。
+    本版未加固（不在本次 P0 范围），仅记录。
+
+（7）风险：温度历史与磁盘写入（1.1.x 新增 TemperatureLog）—— 未改动，建议后续
+    2,000 采样点 + 30s 落盘间隔本身合理；但日志目录/配额清理在 0.9.0 中不存在，
+    属新增 I/O 面，建议在长跑测试中确认无句柄泄漏。
+
+（8）风险：Sparkle 2.9.6 与 0.9.0 一致（Package.resolved 未变）—— 无新增风险。
+    但 1.5.6 的本地签名构建**未启用 hardened runtime**，Sparkle 的 XPC 服务因此
+    没有运行时加固；分发版（Developer ID）不受影响。
+
+================================================================
+四、版本与构建
+================================================================
+· App/Info.plist：CFBundleShortVersionString 1.5.6，CFBundleVersion 156
+· 新增 源码说明-1.5.6.txt / 变更说明-1.5.6.txt / docs/helper-lifecycle-1.5.6.md
+· 修复 脚本/构建-FabBar-Pro.command（拼写错误，导致 一键编译.command 直接失败）
+  → 重写为 脚本/构建-FanBar-Pro.command，固定签名身份后调用 scripts/package-app.sh
+· 构建：zsh scripts/package-app.sh（FANBAR_SIGN_IDENTITY="Local QA Code Signing",
+  FANBAR_ARCHS=arm64, FANBAR_APP_OUTPUT="build/FanBar Pro.app"）
+· 测试：swift test --disable-sandbox --arch arm64 → 498 tests, 0 failures
+· 产物：build/FanBar Pro.app（1.5.6 / 156 / arm64），**未安装到 /Applications**
+
+================================================================
+五、未验证 / 已知限制
+================================================================
+· **真实重启未验证**（本轮禁止重启机器）。已用 launchctl 读状态与 kickstart 逻辑
+  验证「注册在、进程不在 → 重新拉起」的代码路径，但开机时 launchd 对 launch
+  constraint 的求值只能在重启后确认。**「每次重启都能唤起」需用户重启实测。**
+· 本机 sudo 需要密码，无法执行需要 root 的 install 脚本；因此
+  `launchctl bootstrap/kickstart` 的实机执行未验证，仅验证了脚本生成、签名要求
+  （`codesign --verify --strict -R '=identifier "local.fanbar.helper" and certificate
+  leaf = H"BB99EEFC…"'` 实测通过）与沙箱单测。
+· GUI 未启动实测：启动 1.5.6 会触发 helper 迁移（115→156），需要管理员授权并会
+  改写已安装 1.1.5 的 helper 注册，超出本轮授权范围。
+· 已验证可执行：Contents/Helpers/fanbar --help（签名二进制正常加载）、
+  Contents/MacOS/FanBarDiagnostics（成功导出诊断 JSON，已删除临时文件）。

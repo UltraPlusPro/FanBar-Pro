@@ -1,0 +1,165 @@
+name: Code quality
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: zsh {0}
+
+env:
+  # Keep in sync with macos-release.yml so lint/test see the same SDK.
+  DEVELOPER_DIR: /Applications/Xcode_26.0.1.app/Contents/Developer
+  # Minimum line coverage for executable lines added by a pull request.
+  FANBAR_MIN_DIFF_COVERAGE: "60"
+
+jobs:
+  # macOS minutes are the expensive part of CI. Pull requests that touch only files the
+  # Swift build and tests cannot see skip both jobs below. The jobs are skipped rather than
+  # the workflow filtered by paths, so they still report success if made required checks.
+  changes:
+    name: Detect Swift-relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      swift: ${{ steps.filter.outputs.swift }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed files
+        id: filter
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: scripts/ci-swift-relevant.sh "$EVENT_NAME" "$BASE_SHA" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+  lint:
+    name: SwiftLint + SwiftFormat
+    needs: changes
+    if: needs.changes.outputs.swift == 'true'
+    runs-on: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install linters
+        # Versions are pinned in scripts/lint-tools.env so a new upstream rule
+        # can't fail CI on code nobody touched.
+        run: |
+          zsh scripts/install-lint-tools.sh
+          echo "$PWD/.build/lint-tools/bin" >> "$GITHUB_PATH"
+
+      - name: SwiftLint (new violations only)
+        # Existing violations live in .swiftlint-baseline.json; --strict turns
+        # any new warning into a failure.
+        run: swiftlint lint --strict --baseline .swiftlint-baseline.json --reporter github-actions-logging
+
+      - name: SwiftFormat
+        run: swiftformat --lint --reporter github-actions-log .
+
+      - name: Unused code
+        # Every declaration in Sources must be used by Sources; see scripts/unused-code-allowlist.txt.
+        run: python3 scripts/find-unused-code.py
+
+  test:
+    name: Build (0 warnings) + tests + coverage
+    needs: changes
+    if: needs.changes.outputs.swift == 'true'
+    runs-on: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          # Full history so diff coverage can find the merge base.
+          fetch-depth: 0
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-${{ runner.os }}-${{ hashFiles('Package.resolved') }}
+          restore-keys: spm-${{ runner.os }}-
+
+      - name: Build with warnings as errors
+        run: swift build -Xswiftc -warnings-as-errors -Xcc -Werror
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: services/compatibility/package-lock.json
+
+      - name: Start local compatibility service for native client integration
+        env:
+          WRANGLER_SEND_METRICS: 'false'
+          WRANGLER_LOG_PATH: /tmp/fanbar-wrangler-ci.log
+        run: |
+          cd services/compatibility
+          npm ci
+          python3 - <<'PY'
+          from pathlib import Path
+          import secrets
+          Path('.dev.vars').write_text('LIMIT_SALT=' + secrets.token_urlsafe(32) + '\n')
+          PY
+          npm run db:local
+          npm run dev -- --port 8787 --ip 127.0.0.1 > /tmp/fanbar-report-service.log 2>&1 &
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8787/api/policy > /dev/null; then exit 0; fi
+            sleep 1
+          done
+          cat /tmp/fanbar-report-service.log
+          exit 1
+
+      - name: Run tests with coverage
+        env:
+          FANBAR_COMPATIBILITY_TEST_SERVICE_URL: http://127.0.0.1:8787
+        run: swift test --enable-code-coverage
+
+      - name: Coverage report and diff gate
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            python3 scripts/coverage-report.py \
+              --base "origin/${{ github.base_ref }}" \
+              --min-diff "${FANBAR_MIN_DIFF_COVERAGE}"
+          else
+            python3 scripts/coverage-report.py
+          fi
+
+      - name: Upload failed language snapshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-language-snapshots
+          path: |
+            /tmp/fanbar-*-actual.png
+            /tmp/fanbar-*-expected.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload lcov
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: .build/coverage.lcov
+          if-no-files-found: ignore

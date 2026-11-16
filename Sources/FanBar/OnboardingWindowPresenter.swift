@@ -1,0 +1,77 @@
+import AppKit
+import FanBarShared
+import SwiftUI
+
+/// Owns the one-time welcome window independently from the settings window and
+/// the transient status-item popover.
+@MainActor
+final class OnboardingWindowPresenter: NSObject, NSWindowDelegate {
+    static let shared = OnboardingWindowPresenter()
+
+    private var windowController: NSWindowController?
+    private var localizedTitle: LocalizedWindowTitle?
+    private var isCompleting = false
+
+    func show(controller: FanController) {
+        if let window = windowController?.window {
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        let rootView = OnboardingCard(
+            controller: controller,
+            onOpenMenu: { [weak self] in self?.complete(openMenu: true) },
+            onDismiss: { [weak self] in self?.complete(openMenu: false) }
+        )
+        let hostingController = NSHostingController(rootView: rootView)
+        let window = NSWindow(
+            contentRect: NSRect(
+                x: 0,
+                y: 0,
+                width: OnboardingCard.width,
+                height: OnboardingCard.height(for: controller.helperState)
+            ),
+            styleMask: [.titled, .closable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = fanBarText("欢迎使用 FanBar Pro", "Welcome to FanBar Pro")
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
+        window.isReleasedWhenClosed = false
+        window.isRestorable = false
+        window.contentViewController = hostingController
+        window.delegate = self
+        window.center()
+        windowController = NSWindowController(window: window)
+        localizedTitle = LocalizedWindowTitle(window: window, chinese: "欢迎使用 FanBar Pro", english: "Welcome to FanBar Pro")
+
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard !isCompleting else { return }
+        OnboardingPreferences.complete()
+        windowController = nil
+        localizedTitle = nil
+    }
+
+    private func complete(openMenu: Bool) {
+        guard !isCompleting else { return }
+        isCompleting = true
+        OnboardingPreferences.complete()
+        windowController?.close()
+        windowController = nil
+        localizedTitle = nil
+        isCompleting = false
+
+        if openMenu {
+            DispatchQueue.main.async {
+                LegacyStatusItemController.shared.showPopover()
+            }
+        }
+    }
+}

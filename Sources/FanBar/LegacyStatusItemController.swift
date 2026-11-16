@@ -1,0 +1,491 @@
+import AppKit
+import Combine
+import SwiftUI
+
+/// AppKit status-item fallback used by macOS 11, before SwiftUI's MenuBarExtra.
+@MainActor
+final class LegacyStatusItemController: NSObject {
+    static let shared = LegacyStatusItemController()
+
+    private var statusItem: NSStatusItem?
+    private lazy var resourceItems = MenuBarResourceItems(target: self, action: #selector(togglePopover(_:)))
+    /// 1.1.10: the second, independent NSStatusItem for the curve readout.
+    private lazy var curveModeItem = CurveModeStatusItem()
+    /// The status button the open panel hangs from.
+    private weak var activeButton: NSStatusBarButton?
+    private var popover: NSPopover?
+    private weak var controller: FanController?
+    private var observation: AnyCancellable?
+    private var feedbackObservation: AnyCancellable?
+    private var defaultsObservation: NSObjectProtocol?
+    private var powerObservation: NSObjectProtocol?
+    private var localMouseMonitor: Any?
+    private var globalMouseMonitor: Any?
+    private let iconAnimator = MenuBarIconAnimator()
+    /// NSStatusBarButton top-aligns a multi-line title and clips it, so the
+    /// stacked readout is a separate view centered beside the icon.
+    private lazy var stackedLabel: StackedReadoutView = {
+        let label = StackedReadoutView()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.isHidden = true
+        return label
+    }()
+
+    private var stackedLabelLeading: NSLayoutConstraint?
+    /// NSPopover keeps its content view alive after closing, so continuous
+    /// animations inside it must be told when nobody can see them.
+    private let panelVisibility = PanelVisibility()
+    /// The panel's SwiftUI tree and its rendered layers cost several MB, so
+    /// it is built on first open and released a while after closing.
+    private var panelReleaseWorkItem: DispatchWorkItem?
+    private static let panelReleaseDelay: TimeInterval = 60
+
+    func install(controller: FanController) {
+        guard statusItem == nil else { return }
+
+        self.controller = controller
+        controller.showPanel = { [weak self] in self?.showPopover() }
+        curveModeItem.onShowPanel = { [weak self] in self?.showPopover() }
+
+        // A square item accommodates only the icon; text modes need their intrinsic width.
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.toolTip = "FanBar Pro"
+        item.button?.target = self
+        item.button?.action = #selector(togglePopover(_:))
+
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = true
+        popover.delegate = self
+
+        statusItem = item
+        self.popover = popover
+        observation = controller.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.updateButton(); self?.updateResourceItems() }
+        }
+        iconAnimator.onFinish = { [weak self] in self?.updateButton() }
+        feedbackObservation = controller.$switchFeedback
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] signal in
+                self?.handleSwitchFeedback(signal)
+            }
+        defaultsObservation = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                // Disabling the preference mid-animation restores the still icon.
+                if !SwitchFeedbackPreferences.isEffectivelyEnabled {
+                    self?.iconAnimator.stop()
+                }
+                self?.updateButton()
+                self?.updateResourceItems()
+            }
+        }
+        // 1.1.9: Low Power Mode is a hard, non-configurable gate on both
+        // animations. Recompute the menu-bar icon gate on every power-state
+        // change; the SwiftUI panel observes LowPowerModeMonitor directly.
+        _ = LowPowerModeMonitor.shared
+        powerObservation = NotificationCenter.default.addObserver(
+            forName: LowPowerMode.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.updateButton() }
+        }
+        updateButton()
+        updateResourceItems()
+    }
+
+    private func handleSwitchFeedback(_ signal: FanController.SwitchFeedbackSignal?) {
+        guard let signal, statusItem?.button != nil, SwitchFeedbackPreferences.isEffectivelyEnabled else { return }
+        // A switch spins the icon while the request runs and once more when it
+        // lands, even with the fans stopped; a failure flashes instead.
+        switch signal {
+        case .began, .ended(successfully: true):
+            iconAnimator.playSwitchBurst()
+        case .ended(successfully: false):
+            iconAnimator.flashFailure()
+        }
+    }
+
+    @objc private func togglePopover(_ sender: Any?) {
+        let button = sender as? NSStatusBarButton ?? statusItem?.button
+        switch MenuBarPanelClick.action(isShown: popover?.isShown == true, fromAnchorItem: activeButton === button) {
+        case .open:
+            showPopover(from: button, resource: resourceItems.resource(for: button))
+        case .close:
+            closePopover(sender)
+        case .move:
+            popover?.closeImmediately()
+            stopOutsideClickMonitoring()
+            showPopover(from: button, resource: resourceItems.resource(for: button))
+        }
+    }
+
+    /// Presents the primary panel, including when invoked by onboarding.
+    func showPopover() {
+        showPopover(from: statusItem?.button, resource: nil)
+    }
+
+    private func showPopover(from button: NSStatusBarButton?, resource: MenuBarResource?) {
+        guard let button, let popover, !popover.isShown else { return }
+        panelReleaseWorkItem?.cancel()
+        panelReleaseWorkItem = nil
+        panelVisibility.focusedResource = resource?.panelResource
+        activeButton = button
+        installPanelContentIfNeeded(in: popover)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        popover.appearance = nil
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popover.contentViewController?.view.window?.makeKey()
+        clearInitialFocus(in: popover)
+        startOutsideClickMonitoring()
+    }
+
+    private func updateResourceItems() {
+        guard let controller else { return }
+        resourceItems.update(usage: controller.usage) { [weak self] button in
+            guard let self, self.activeButton === button, self.popover?.isShown == true else { return }
+            self.closePopover(nil)
+        }
+    }
+
+    private func installPanelContentIfNeeded(in popover: NSPopover) {
+        guard popover.contentViewController == nil, let controller else { return }
+        let hostingController = NSHostingController(
+            rootView: PanelRoot(controller: controller, visibility: panelVisibility)
+        )
+        popover.contentViewController = hostingController
+        hostingController.view.layoutSubtreeIfNeeded()
+        let fittingSize = hostingController.view.fittingSize
+        popover.contentSize = NSSize(
+            width: FanMenu.panelWidth,
+            height: min(fittingSize.height, (NSScreen.main?.visibleFrame.height ?? 800) - 70)
+        )
+    }
+
+    /// Keeps a quick reopen instant while letting an idle menu bar app shed
+    /// the panel's view graph.
+    private func schedulePanelRelease() {
+        panelReleaseWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, let popover = self.popover, !popover.isShown else { return }
+            popover.contentViewController = nil
+            self.panelReleaseWorkItem = nil
+            MemoryRelief.returnFreedPages()
+        }
+        panelReleaseWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.panelReleaseDelay, execute: workItem)
+    }
+
+    /// AppKit hands initial focus to the first control, which draws a focus
+    /// ring before the user has touched the keyboard. Start on the panel
+    /// itself instead; Tab still reaches every control. SwiftUI may assign
+    /// focus once more after the first layout, so clear it again then.
+    private func clearInitialFocus(in popover: NSPopover) {
+        let window = popover.contentViewController?.view.window
+        window?.makeFirstResponder(nil)
+        DispatchQueue.main.async { [weak window] in
+            window?.makeFirstResponder(nil)
+        }
+    }
+
+    private func startOutsideClickMonitoring() {
+        stopOutsideClickMonitoring()
+        let mouseDownEvents: NSEvent.EventTypeMask = [
+            .leftMouseDown,
+            .rightMouseDown,
+            .otherMouseDown
+        ]
+
+        // Local monitoring handles clicks in FanBar's own windows. Preserve
+        // clicks inside the popover and on its status button for normal actions.
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: mouseDownEvents
+        ) { [weak self] event in
+            guard let self, self.shouldClosePopover(for: event) else { return event }
+            self.closePopover(event)
+            return event
+        }
+
+        // Global monitoring covers the desktop, menu bar, and other apps. This
+        // explicitly closes the panel on systems where .transient misses them.
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: mouseDownEvents
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.closePopover(nil)
+            }
+        }
+    }
+
+    private func shouldClosePopover(for event: NSEvent) -> Bool {
+        guard popover?.isShown == true else { return false }
+        let clickedWindow = event.window
+        let popoverWindow = popover?.contentViewController?.view.window
+        let statusItemWindows = [statusItem?.button?.window, curveModeItem.button?.window].compactMap { $0 }
+            + resourceItems.windows
+        return clickedWindow !== popoverWindow && !statusItemWindows.contains { $0 === clickedWindow }
+    }
+
+    private func closePopover(_ sender: Any?) {
+        popover?.performClose(sender)
+        stopOutsideClickMonitoring()
+    }
+
+    private func stopOutsideClickMonitoring() {
+        if let localMouseMonitor {
+            NSEvent.removeMonitor(localMouseMonitor)
+            self.localMouseMonitor = nil
+        }
+        if let globalMouseMonitor {
+            NSEvent.removeMonitor(globalMouseMonitor)
+            self.globalMouseMonitor = nil
+        }
+    }
+
+    private func updateButton() {
+        guard let button = statusItem?.button, let controller else { return }
+        // The temperature-logic preference is read the same way as the display
+        // mode: the legacy path has no SwiftUI @AppStorage to observe.
+        let temperatureSource = MenuBarTemperatureSource.current
+        button.toolTip = controller.temperatureToolTip(source: temperatureSource)
+        let modeRawValue = UserDefaults.standard.string(forKey: MenuBarDisplayMode.preferenceKey)
+        // 1.1.10: `resolve` also maps the 1.1.9 `curveMode` token, so an
+        // upgrade keeps the second item visible instead of dropping it.
+        let displayMode = MenuBarDisplayMode.resolve(rawValue: modeRawValue)
+        // The fan icon stays in this (primary) status item; the curve readout
+        // gets its own independent NSStatusItem, created/removed here so the
+        // two items can be ⌘-dragged apart.
+        curveModeItem.update(controller: controller, readout: displayMode.curveReadout)
+        let iconStyle = MenuBarIconStyle.current
+        let text: String?
+        switch displayMode {
+        case .iconOnly, .curveTemperature, .curveRPM:
+            text = nil
+        case .cpuTemperature:
+            text = temperatureText(for: controller)
+        case .fanSpeed:
+            text = averageFanSpeed(for: controller)
+        case .temperatureAndFanSpeed:
+            text = "\(temperatureText(for: controller)) · \(averageFanSpeed(for: controller))"
+        case .temperatureOverFanSpeed:
+            text = "\(temperatureText(for: controller))\n\(averageFanSpeed(for: controller))"
+        }
+
+        // Drive the icon with the live fan reading: it spins while the fans
+        // run and coasts to a stop when they halt. While any animation is
+        // active the animator owns button.image, so the two-second refresh
+        // must not clobber the rotating frames.
+        // 1.1.9: Low Power Mode pauses the icon rotation even when the switch
+        // is on; `isEffectivelyEnabled` folds in that hard constraint.
+        if SwitchFeedbackPreferences.isEffectivelyEnabled {
+            iconAnimator.update(
+                rpm: averageFanRPM(for: controller),
+                on: button,
+                style: iconStyle,
+                isManual: controller.isManualStatus
+            )
+        } else {
+            iconAnimator.stop()
+        }
+        if !iconAnimator.isAnimating {
+            let still = stillIcon(style: iconStyle, isManual: controller.isManualStatus)
+            // Assigning even an equal new image re-snapshots every menu bar.
+            if button.image !== still { button.image = still }
+        }
+        // Digits should not change their advance width as the reading changes.
+        button.font = text == nil
+            ? NSFont.systemFont(ofSize: 12, weight: .medium)
+            : NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        let isStacked = displayMode == .temperatureOverFanSpeed
+        if isStacked, let text {
+            installStackedLabelIfNeeded(in: button)
+            stackedLabel.text = text
+            // An invisible title as wide as the widest line keeps AppKit's own
+            // icon + title layout, so the icon sits where it does in the other
+            // text modes and the label only has to cover the title slot.
+            button.attributedTitle = Self.stackedPlaceholder
+            button.imagePosition = .imageLeading
+        } else {
+            button.title = text ?? ""
+            button.imagePosition = text == nil ? .imageOnly : .imageLeading
+        }
+        stackedLabel.isHidden = !isStacked
+        if isStacked, let cell = button.cell {
+            button.layoutSubtreeIfNeeded()
+            stackedLabelLeading?.constant = cell.titleRect(forBounds: button.bounds).minX
+        }
+        button.setAccessibilityTitle(isStacked ? text?.replacingOccurrences(of: "\n", with: ", ") : nil)
+        button.imageScaling = .scaleProportionallyDown
+        button.imageHugsTitle = true
+        // Keep a stable width once text is enabled. A variable-length status
+        // item moves its popover anchor whenever a changing value gains or
+        // loses a digit, which makes the menu appear to jump while refreshing.
+        let targetLength = statusItemLength(for: displayMode, iconWidth: button.image?.size.width ?? 16)
+        if statusItem?.length != targetLength {
+            statusItem?.length = targetLength
+        }
+    }
+
+    private func installStackedLabelIfNeeded(in button: NSStatusBarButton) {
+        guard stackedLabel.superview !== button else { return }
+        button.addSubview(stackedLabel)
+        let leading = stackedLabel.leadingAnchor.constraint(equalTo: button.leadingAnchor)
+        NSLayoutConstraint.activate([
+            leading,
+            stackedLabel.topAnchor.constraint(equalTo: button.topAnchor),
+            stackedLabel.bottomAnchor.constraint(equalTo: button.bottomAnchor),
+            stackedLabel.widthAnchor.constraint(equalToConstant: ceil(Self.stackedPlaceholder.size().width))
+        ])
+        stackedLabelLeading = leading
+    }
+
+    private static let stackedPlaceholder = NSAttributedString(string: "8,888", attributes: [
+        .font: stackedFont,
+        .foregroundColor: NSColor.clear
+    ])
+
+    fileprivate static let stackedFont = NSFont.monospacedDigitSystemFont(
+        ofSize: MenuBarDisplayMode.stackedFontSize,
+        weight: .medium
+    )
+
+    /// Width sized to the widest reading each mode can show (not the current
+    /// one), so the popover anchor stays put without leaving wide side gaps.
+    private func statusItemLength(for displayMode: MenuBarDisplayMode, iconWidth: CGFloat) -> CGFloat {
+        let widestText: String
+        switch displayMode {
+        case .iconOnly, .curveTemperature, .curveRPM:
+            return NSStatusItem.squareLength
+        case .cpuTemperature:
+            widestText = "100°"
+        case .fanSpeed:
+            widestText = "8,888"
+        case .temperatureAndFanSpeed:
+            widestText = "100° · 8,888"
+        case .temperatureOverFanSpeed:
+            // Only the wider of the two lines counts.
+            let textWidth = Self.stackedPlaceholder.size().width
+            return ceil(iconWidth + 3 + textWidth + 3)
+        }
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        let textWidth = (widestText as NSString).size(withAttributes: [.font: font]).width
+        // icon + image/title gap + text + button's horizontal inset on both sides.
+        return ceil(iconWidth + 3 + textWidth + 3)
+    }
+
+    private var stillIcons: [String: NSImage] = [:]
+
+    private func stillIcon(style: MenuBarIconStyle, isManual: Bool) -> NSImage {
+        let key = "\(style.rawValue)-\(isManual)"
+        if let cached = stillIcons[key] { return cached }
+        let image = MenuBarIconAnimator.staticIcon(style: style, isManual: isManual)
+        stillIcons[key] = image
+        return image
+    }
+
+    private func temperatureText(for controller: FanController) -> String {
+        // Same rule as the SwiftUI label: the menu bar honours the temperature
+        // logic preference while fan control keeps the averaged SoC input.
+        let source = MenuBarTemperatureSource(
+            rawValue: UserDefaults.standard.string(forKey: MenuBarTemperatureSource.preferenceKey) ?? ""
+        ) ?? .defaultSource
+        return controller.menuBarTemperatureCelsius(source: source)
+            .map { "\(Int($0.rounded()))°" } ?? "—°"
+    }
+
+    private func averageFanRPM(for controller: FanController) -> Double {
+        guard !controller.fans.isEmpty else { return 0 }
+        let total = controller.fans.map(\.currentRPM).reduce(0, +)
+        return Double(total) / Double(controller.fans.count)
+    }
+
+    private func averageFanSpeed(for controller: FanController) -> String {
+        guard !controller.fans.isEmpty else { return "— RPM" }
+        let total = controller.fans.map(\.currentRPM).reduce(0, +)
+        let average = Int((Double(total) / Double(controller.fans.count)).rounded())
+        return FanBarNumberFormatter.grouped(average)
+    }
+}
+
+extension LegacyStatusItemController: NSPopoverDelegate {
+    func popoverWillShow(_ notification: Notification) {
+        panelVisibility.isVisible = true
+        controller?.setPanelVisible(true)
+        controller?.refreshServiceStatus()
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        // Moving the panel to another item reopens it at once. A late close
+        // notification must not clear the new item's focus or release the panel.
+        guard popover?.isShown != true else { return }
+        // Also clean up when AppKit closes the transient popover itself.
+        stopOutsideClickMonitoring()
+        panelVisibility.isVisible = false
+        panelVisibility.focusedResource = nil
+        activeButton = nil
+        controller?.setPanelVisible(false)
+        schedulePanelRelease()
+    }
+}
+
+/// Draws the two-line menu bar readout.
+///
+/// AppKit snapshots the status button once per menu bar replicant and assigns
+/// each snapshot's appearance to the button first. An NSTextField answers that
+/// appearance change by invalidating its intrinsic size and display, which
+/// schedules the next snapshot, so the status item never stops redrawing. This
+/// view has no intrinsic size and only repaints when its text changes.
+private final class StackedReadoutView: NSView {
+    private static let lineHeight: CGFloat = 10
+
+    var text = "" {
+        didSet {
+            guard text != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        guard !lines.isEmpty else { return }
+        // Resolved at draw time, so it follows each replicant's appearance.
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: LegacyStatusItemController.stackedFont,
+            .foregroundColor: NSColor.labelColor
+        ]
+        let font = LegacyStatusItemController.stackedFont
+        var y = ((bounds.height - Self.lineHeight * CGFloat(lines.count)) / 2).rounded()
+        for line in lines {
+            // Center each glyph run within its fixed line box.
+            let baselineOffset = (Self.lineHeight - (font.ascender - font.descender)) / 2
+            NSAttributedString(string: String(line), attributes: attributes)
+                .draw(at: NSPoint(x: 0, y: y + baselineOffset))
+            y += Self.lineHeight
+        }
+    }
+}
+
+/// Whether the popover is on screen.
+@MainActor
+final class PanelVisibility: ObservableObject {
+    @Published var isVisible = false
+    @Published var focusedResource: PanelResourceList.Resource?
+}
+
+/// Passes the popover's visibility into the panel's environment.
+private struct PanelRoot: View {
+    let controller: FanController
+    @ObservedObject var visibility: PanelVisibility
+
+    var body: some View {
+        FanMenu(controller: controller)
+            .environment(\.isPanelVisible, visibility.isVisible)
+            .environment(\.focusedMenuBarResource, visibility.focusedResource)
+    }
+}

@@ -1,0 +1,91 @@
+FanBar Pro 1.1.11 (build 121) 版本说明
+2026-11-15 两项意见交付；2026-11-16 追加：DMG 内附源码与 Xcode 工程（arm64）
+================================================================================
+
+版本：1.1.10 / 120 → 1.1.11 / 121；Bundle ID（local.fanbar.app）、
+最低系统版本（15.8）不变。全包（app + helper + CLI + Diagnostics +
+Widget + Sparkle 等嵌套组件）均由本机自签证书 Local QA Code Signing 签名。
+本版为完整源码重建（scripts/package-app.sh，含签名审计门禁）。
+
+--------------------------------------------------------------------------------
+一、记录设置 → 高级 → 保留：新增「2 天」
+--------------------------------------------------------------------------------
+· TemperatureLogPreferences.retentionOptions 由 [7, 30, 90, 0] 改为
+  [2, 7, 30, 90, 0]：档位仍按「从短到长、永久垫底」排列，默认值仍是 30 天，
+  已存过的 7 / 30 / 90 / 永久原样保留，升级用户不受影响。
+· 选 2 天后：
+  · 摘要与折叠行立刻显示「保留 2 天」（TemperatureLogText.retention 走
+    「保留 %d 天」模板，无需新增文案）。
+  · 同一行右侧的占用估算同步下调（TemperatureLogSizeEstimate 按保留天数折算，
+    2 天的上限约为 7 天的 2/7），不会继续显示 7 天那一档的数字。
+  · 清理时机不变：每次写入时每天最多清一次，切换档位会立刻触发一次
+    （requestCleanup），所以改成 2 天不用等第二天才生效。
+· 为什么是 2 天：CSV 按天分文件，2 天是「今天 + 昨天」都能留着的最短窗口，
+  正好够回看一次偶发的风扇飙升，又不会让日志占着磁盘。
+
+--------------------------------------------------------------------------------
+二、曲线与温度 / 曲线与转速：下拉菜单补上「macOS」系统默认项
+--------------------------------------------------------------------------------
+· 1.1.10 里第二个菜单栏图标（曲线档位图标 + 读数）的下拉菜单只有 6 个曲线档位
+  （静谧 / 均衡 / 性能 / 极速 / 固定 / 自定义…），没有把风扇交还 macOS 的入口，
+  想回自动控制必须先点开风扇图标的面板。
+· 1.1.11 给 CurveMode 增加 systemDefault 档，并排在 allCases 最前：
+  · 菜单第 1 行 = 「macOS」（与主面板同名同图标
+    arrow.triangle.2.circlepath），其下一条分隔线再列各曲线档位，
+    最后一条分隔线后仍是「打开面板…」。
+  · 点击它调用 FanController.setAutomatic()，与主面板「macOS」完全同一条路径。
+  · 当前处于自动控制时，该项打勾；同时**菜单栏图标也变为 macOS 的循环箭头图标**
+    —— 1.1.10 在自动控制下仍显示上一次的曲线档位图标，读起来像"还在跑曲线"。
+  · 曲线档位图标与行为一律不变：固定仍按当前平均转速冻结、自定义…仍打开曲线编辑页。
+· 兼容性：CurveMode 的 rawValue 只用于菜单内部回传，不落盘，
+  因此新增档位不影响任何已存偏好。
+
+--------------------------------------------------------------------------------
+三、兼容性
+--------------------------------------------------------------------------------
+· 偏好键名全部沿用：fanbar.temperatureLog.*（含 retentionDays）、
+  fanbar.menuBarDisplayMode / fanbar.menuBarTemperatureSource /
+  fanbar.automaticRestoreDuration / fanbar.resumeLastCurveOnLaunch /
+  fanbar.resumeLastCurveMode。本版没有新增偏好键。
+· 本地化目录无新增英文串：「macOS」早已是既有 key（主面板在用），
+  2 天走既有的「%d 天 / %d days」模板，11 份完整目录与 4 份部分目录均不需改动。
+· 安装器（安装FanBarPro.app / 卸载FanBarPro.app）沿用卡巴斯基式两段式流程：
+  安装期以 root 直接注册 local.fanbar.helper（LegacyLaunchd）与
+  local.fanbar.coldstart（开机冷启动）两项服务，用户无需进系统设置。
+
+--------------------------------------------------------------------------------
+四、验证
+--------------------------------------------------------------------------------
+· 单元测试：swift test 全量通过，0 失败。新增
+  CurveModeMenuTests 7 项（macOS 排首位、唯一交还语义、标题/图标、
+  rawValue 往返、四个内置档位映射不变）与
+  TemperatureLogMaintenanceTests 的 2 天保留 3 项
+  （档位顺序合法、存 2 不回退 30、文案与占用估算随天数下降）。
+· 构建：swift build -c release 通过；scripts/package-app.sh 走完
+  codesign → audit-bundle.sh 六道签名闸门 → 产物签名自检。
+· 安装器：build-installer.sh 生成 Installer 1.1.11 / 121；
+  安装/卸载脚本 bash -n 语法通过。
+· 实机冒烟：沙盒干跑 RESULT|ok，真机安装后 /Applications/FanBar Pro.app
+  为 1.1.11/121（root:wheel），local.fanbar.helper state=running，
+  CLI `fanbar status` 直读硬件；界面确认「保留」下拉已含 2 天、
+  曲线图标下拉第一行为 macOS 且可切回自动控制。
+
+--------------------------------------------------------------------------------
+五、DMG 内含源码包（本版新增）
+--------------------------------------------------------------------------------
+· 镜像根目录除 安装FanBarPro.app / 卸载FanBarPro.app 外，新增
+  FanBar-Pro-1.1.11-源码与Xcode工程.zip（约 26 MB，595 个条目）：
+  · 完整 Swift 源码（8 个 target）+ Package.swift / Package.resolved
+  · FanBarPro.xcodeproj（双击可 ⌘B 编译）
+  · Installer/ —— 本次交付所用的安装器与卸载器源码，含 root 安装引擎
+    engine/install-core.sh、build-installer.sh、make-fanbar-dmg.sh
+  · 一键编译.command、一键打包DMG.command、脚本/、README-构建说明.txt
+· 可解压到任意目录后直接构建（包内无硬编码绝对路径），实测：
+    swift build -c release                     → Build complete!（82 秒）
+    bash Installer/build-installer.sh          → 安装器/卸载器均编译并签名成功
+· 重建安装器前必须先产出主程序：安装器会把已签名的主程序整包内嵌到
+  Contents/Resources/Payload/，没有主程序时脚本只给一条警告、不内嵌。
+  完整顺序见包内 README-构建说明.txt 的「1.1.11 必读：构建顺序」。
+· 源码包的排除项：.build/、build/、dist/、.git/、xcuserdata、*.bak，
+  只剔除编译缓存与历史备份，不影响任何构建路径。
+· 校验：unzip -t 通过；595 个条目全部为 UTF-8 文件名（中文名不会乱码）。

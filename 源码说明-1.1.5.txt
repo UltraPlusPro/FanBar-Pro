@@ -1,0 +1,77 @@
+FanBar Pro 1.1.5 源码说明
+============================
+
+⚠️ 历史文档，仅供参考。当前版本请读「源码说明-1.1.7.txt」。
+   本文中的 ad-hoc 签名做法（FANBAR_ALLOW_ADHOC=1 FANBAR_SIGN_IDENTITY=-）
+   在 1.1.7 起已不再支持：构建脚本会直接失败退出，请改用真实的代码签名
+   身份（例如 "Local QA Code Signing"）。
+
+版本：FanBar Pro 1.1.5（CFBundleVersion = 115）
+Bundle ID：local.fanbar.app（未变，特权 Helper 的客户端鉴权依赖它）
+可执行文件名：FanBar Pro（.app 与 Contents/MacOS/ 均为该名）
+架构：arm64　最低系统：macOS 13（Widget 工程 target 以 Xcode 设置为准）
+
+一、本包内容
+------------
+- Sources/FanBar/            主程序（AppKit / SwiftUI）
+- Sources/FanBarShared/      共享层（本地化、诊断、协议）
+- Sources/FanBarHelper/      特权 Helper
+- Sources/FanBarCLI/         命令行工具 fanbar
+- Sources/FanBarWidget/      Widget 数据层
+- WidgetExtension/FanBarWidgetExtension.xcodeproj   Widget 的 Xcode 工程
+- FanBarPro.xcodeproj        主工程的 Xcode 工程
+- Tests/FanBarTests/         单元测试（含 FanCurve 交互/编辑测试）
+- scripts/package-app.sh     一键构建 + 组装 .app + 签名
+- App/Info.plist             版本与 bundle 元数据
+- Assets/、Resources/        图标与资源
+
+二、构建方式（本机已验证）
+--------------------------
+    cd <本目录>
+    export FANBAR_ALLOW_ADHOC=1 FANBAR_SIGN_IDENTITY=- FANBAR_ARCHS=arm64
+    export FANBAR_DISABLE_SWIFTPM_SANDBOX=1
+    zsh scripts/package-app.sh
+    # 产物：dist/FanBar Pro.app
+
+说明：
+- 本机无 Developer ID 证书，故用 ad-hoc 签名（FANBAR_SIGN_IDENTITY=-）。
+  有证书时改为 `FANBAR_SIGN_IDENTITY="Developer ID Application: ..."`。
+- 首次构建会由 SwiftPM 拉取 Sparkle（Package.resolved 已锁定版本）。
+- 可选：把源码包重新塞回 .app（与交付版一致的做法）——
+      FANBAR_SOURCE_ZIP=/path/to/FanBar-Pro-1.1.5-源码与Xcode工程.zip \
+        zsh scripts/package-app.sh
+  脚本会在签名前把 zip 复制到 Contents/Resources/Source/，因此签名依旧有效。
+- 也可用 Xcode 打开 FanBarPro.xcodeproj；Widget 需同时构建
+  WidgetExtension/FanBarWidgetExtension.xcodeproj。
+
+三、测试
+--------
+    swift test --disable-sandbox --arch arm64
+    # 只跑曲线相关：
+    swift test --disable-sandbox --arch arm64 --filter FanCurve
+
+四、1.1.5 相对 1.1.4 的改动
+---------------------------
+1. 品牌修正：底层源码到 GUI 全量 FanBar（原拼写错误已清除），
+   .app 与可执行文件更名为 FanBar Pro；bundle id 保持 local.fanbar.app。
+2. 风扇曲线编辑器修复：原「每个控制点各自挂 DragGesture + .position()」在
+   SwiftUI 下坐标错位，导致只有最右侧点可拖动。改为画布级单一手势 +
+   最近点命中（8pt）+ 复用 FanCurveDragGeometry 的抓取偏移。
+3. 诊断/崩溃上报：进程名与镜像名白名单改为常量组，同时接受 FanBar 与
+   FanBar Pro，并支持 FanBar Pro-*.ips 崩溃文件名（改名后仍能识别自身）。
+4. 本地化：补齐俄语缺失的 9 条增强文案，删除失效条目 Auto；
+   英文 "The two options below…" 更正为 "above…"（与中文「以上两项」一致）；
+   句中旧品牌名统一为 FanBar Pro。
+5. 散热设置：标题「优化选项」，正文「以上两项会在…」。
+6. Widget 工程：补齐 6 个本地化 catalog 的编译引用（原工程漂移会导致
+   FanBarShared 编译失败）。
+7. 测试：修正两处过期断言（时间范围已含 2 分钟档；俄/法在四档分段下的
+   标题回退改为显式断言）。
+
+五、备注
+--------
+- 本源码包与 DMG 内 FanBar Pro.app 完全同源：**未内嵌本源码包**时，从本包重建出的
+  可执行文件 sha256 为 `0225eaa2d24ca1a8…`，与 1.1.5 交付构建一致。
+  交付版把源码包放进了 `Contents/Resources/Source/`，`codesign` 的密封因此覆盖了这个
+  zip，可执行文件的签名段随之变化（**代码本身没有任何差异**）。
+- 未包含 .build/、dist/ 等构建产物。
